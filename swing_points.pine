@@ -1,0 +1,97 @@
+// =============================================================================
+// Swing Points Indicator (Bullish Lows / Bearish Highs)
+// Pine Script v5
+// =============================================================================
+// What it does:
+//   - Detects 3-candle swing pivots:
+//       * Bullish Swing Low  -> middle candle's LOW  is lower  than its neighbors
+//       * Bearish Swing High -> middle candle's HIGH is higher than its neighbors
+//   - Plots labels on the chart at the pivot candle.
+//
+// Why it does NOT repaint:
+//   - We only evaluate a candle after the NEXT candle has fully closed.
+//   - Concretely, we look at the bar one position back (the "middle" candle)
+//     and compare it to:
+//         * the bar before it (already closed long ago), and
+//         * the current confirmed bar (the bar AFTER the middle).
+//   - We also gate everything with `barstate.isconfirmed`, so the script only
+//     reacts on a closed bar. Once a label is drawn, it stays put.
+// =============================================================================
+
+//@version=5
+indicator(
+     title    = "Swing Points (Bullish Lows / Bearish Highs)",
+     shorttitle = "Swings",
+     overlay  = true,            // draw on the price chart, not a sub-pane
+     max_labels_count = 500      // keep the most recent 500 labels on screen
+ )
+
+// -----------------------------------------------------------------------------
+// User Inputs
+// -----------------------------------------------------------------------------
+// You can tweak the visuals from the indicator settings panel.
+showBullish   = input.bool(true,   "Show Bullish Swing Lows",  group = "Display")
+showBearish   = input.bool(true,   "Show Bearish Swing Highs", group = "Display")
+
+bullishColor  = input.color(color.new(color.green, 0), "Bullish Label Color", group = "Style")
+bearishColor  = input.color(color.new(color.red,   0), "Bearish Label Color", group = "Style")
+labelTextColor = input.color(color.white,             "Label Text Color",    group = "Style")
+
+// -----------------------------------------------------------------------------
+// Swing Detection Logic
+// -----------------------------------------------------------------------------
+// Pine Script accesses past values with the [] operator:
+//     low      -> low of the CURRENT bar (the "after" candle)
+//     low[1]   -> low of the PREVIOUS bar (the "middle" candidate)
+//     low[2]   -> low of TWO bars ago     (the "before" candle)
+//
+// A bullish swing low is confirmed when:
+//     low[1] < low[2]   (middle is lower than the bar before it)
+//     low[1] < low      (middle is lower than the bar after it = current bar)
+//
+// Because we evaluate this only AFTER the current bar closes (barstate.isconfirmed),
+// the middle bar's status will never change again -> no repaint.
+isBullishSwingLow  = barstate.isconfirmed and low[1]  < low[2]  and low[1]  < low
+
+// A bearish swing high is the mirror image:
+//     high[1] > high[2] (middle is higher than the bar before it)
+//     high[1] > high    (middle is higher than the bar after it = current bar)
+isBearishSwingHigh = barstate.isconfirmed and high[1] > high[2] and high[1] > high
+
+// -----------------------------------------------------------------------------
+// Plot Labels on the Chart
+// -----------------------------------------------------------------------------
+// Important: the swing happened on the PREVIOUS bar, so we anchor labels
+// using `bar_index - 1` and the historical price `low[1]` / `high[1]`.
+
+// --- Bullish Swing Low label (drawn below the pivot candle) ---
+if showBullish and isBullishSwingLow
+    label.new(
+         x         = bar_index - 1,        // attach to the middle (pivot) bar
+         y         = low[1],               // at the pivot's low price
+         text      = "SL",                 // SL = Swing Low
+         style     = label.style_label_up, // arrow points UP toward the candle
+         color     = bullishColor,
+         textcolor = labelTextColor,
+         size      = size.small,
+         yloc      = yloc.belowbar         // place the label below the bar
+     )
+
+// --- Bearish Swing High label (drawn above the pivot candle) ---
+if showBearish and isBearishSwingHigh
+    label.new(
+         x         = bar_index - 1,           // attach to the middle (pivot) bar
+         y         = high[1],                 // at the pivot's high price
+         text      = "SH",                    // SH = Swing High
+         style     = label.style_label_down,  // arrow points DOWN toward the candle
+         color     = bearishColor,
+         textcolor = labelTextColor,
+         size      = size.small,
+         yloc      = yloc.abovebar            // place the label above the bar
+     )
+
+// -----------------------------------------------------------------------------
+// Optional: alerts so you get notified when a swing prints
+// -----------------------------------------------------------------------------
+alertcondition(isBullishSwingLow,  title = "Bullish Swing Low",  message = "Bullish Swing Low confirmed")
+alertcondition(isBearishSwingHigh, title = "Bearish Swing High", message = "Bearish Swing High confirmed")
