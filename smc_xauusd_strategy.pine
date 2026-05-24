@@ -1,0 +1,522 @@
+// =============================================================================
+//  SMC XAUUSD Session Strategy  -  London / New York Kill-Zone Reversal Bot
+//  Pine Script v5  |  strategy()  |  Tuned for XAUUSD (Gold)
+// =============================================================================
+//
+//  GOAL
+//  ----
+//  A strategy you can run every day on gold during the London or New York
+//  kill-zones. It looks for an institutional reversal pattern:
+//
+//        Liquidity sweep  ->  Change of Character  ->  Entry in correct zone
+//
+//  ENTRY LOGIC (LONG, mirrored for SHORT)
+//  --------------------------------------
+//  1) HTF BIAS         : HTF close above EMA(htfEmaLen) on `htfBiasTF`
+//                        (set to "" to disable HTF filter and trade both sides)
+//  2) SESSION          : Current bar inside London KZ or NY KZ (configurable)
+//  3) LIQUIDITY SWEEP  : Price wicked below the most recent swing low and
+//                        closed back above it (stop-hunt of sell-stops)
+//  4) CHoCH UP         : Within `chochWindow` bars of the sweep, price closes
+//                        above the most recent swing HIGH (structure flip)
+//  5) ZONE FILTER      : Optional - require entry in the Discount half of the
+//                        active range (institutional buy zone)
+//  6) RISK GATES       : Daily loss limit not breached, max trades/day not hit
+//
+//  EXIT LOGIC
+//  ----------
+//  - Stop Loss : a few ticks beyond the swept extreme, padded by ATR x slBuffer
+//  - TP1       : at  rrTp1  (default 1R) -> closes  tp1ClosePct % of position
+//                and moves stop to break-even on the remainder
+//  - TP2       : at  rrTp2  (default 2R) -> closes the rest
+//  - Time stop : optional - close any open trade at session end
+//
+//  RISK MANAGEMENT
+//  ---------------
+//  - Position size = riskPerTrade % of equity / SL distance (true % risk)
+//  - Max trades per day  (resets at midnight chart-tz)
+//  - Daily loss lockout  (no more entries if equity drops below threshold today)
+//  - One-way only: no pyramiding, no opposite trade until current is flat
+//
+//  RECOMMENDED SETTINGS FOR XAUUSD
+//  -------------------------------
+//      Timeframe         : M15 (best balance) or M5 for scalping, H1 for swing
+//      htfBiasTF         : "240"  (H4) for M15;   "60" (H1) for M5
+//      Sessions          : London KZ + NY AM KZ (default)
+//      riskPerTrade      : 0.5% to 1%
+//      rrTp1 / rrTp2     : 1.0R / 2.5R
+// =============================================================================
+
+//@version=5
+strategy(
+     title                   = "SMC XAUUSD Session Strategy",
+     shorttitle              = "SMC NY/LDN",
+     overlay                 = true,
+     pyramiding              = 0,
+     initial_capital         = 10000,
+     currency                = currency.USD,
+     default_qty_type        = strategy.percent_of_equity,
+     default_qty_value       = 100,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.02,
+     slippage                = 2,
+     process_orders_on_close = true,
+     calc_on_every_tick      = false,
+     max_labels_count        = 500,
+     max_lines_count         = 500,
+     max_boxes_count         = 300
+ )
+
+// =============================================================================
+//  1. INPUTS
+// =============================================================================
+
+// --- Sessions ----------------------------------------------------------------
+gpSes      = "1) Sessions (chart timezone)"
+useLondon  = input.bool(true,  "Trade London Kill Zone", group = gpSes)
+sessLondon = input.session("0700-1000", "London KZ session", group = gpSes,
+     tooltip = "ICT London kill-zone, default 07:00-10:00 UTC. Adjust if your "
+             + "chart timezone is different. Use New York time 02:00-05:00 if "
+             + "your chart is on America/New_York.")
+useNY      = input.bool(true,  "Trade New York AM Kill Zone", group = gpSes)
+sessNY     = input.session("1200-1500", "New York KZ session", group = gpSes,
+     tooltip = "ICT NY AM kill-zone, default 12:00-15:00 UTC.")
+sessTZ     = input.string("UTC", "Session timezone",
+     options = ["UTC", "Europe/London", "America/New_York", "Asia/Tokyo"], group = gpSes)
+closeOnEnd = input.bool(true, "Close open trades at session end", group = gpSes,
+     tooltip = "If a trade is still open when the kill-zone ends, exit at market.")
+
+// --- HTF Bias ----------------------------------------------------------------
+gpBias     = "2) Higher Timeframe Bias"
+useBias    = input.bool(true, "Use HTF bias filter", group = gpBias,
+     tooltip = "Only take longs when HTF closes above EMA, only shorts when below.")
+htfBiasTF  = input.timeframe("240", "HTF for bias", group = gpBias,
+     tooltip = "240 = H4. Use 60 (H1) on M5, 240 (H4) on M15, D on H1+.")
+htfEmaLen  = input.int(50, "HTF EMA length", minval = 5, group = gpBias)
+
+// --- Swings & Structure ------------------------------------------------------
+gpStr      = "3) Structure"
+leftBars   = input.int(5, "Pivot Left",  minval = 1, group = gpStr)
+rightBars  = input.int(5, "Pivot Right", minval = 1, group = gpStr,
+     tooltip = "Higher = stronger swings, fewer signals. 5 is a good default for M15 gold.")
+
+// --- Reversal confluence -----------------------------------------------------
+gpRev      = "4) Reversal Confluence"
+sweepLkbk  = input.int(20, "Max bars between swing and sweep", minval = 3, group = gpRev)
+chochWin   = input.int(15, "Max bars from sweep to CHoCH",     minval = 1, group = gpRev)
+needZone   = input.bool(true, "Require Premium/Discount zone", group = gpRev,
+     tooltip = "Longs only in Discount half of active range, shorts only in Premium half.")
+
+// --- Risk management ---------------------------------------------------------
+gpRisk     = "5) Risk Management"
+riskPct    = input.float(0.5, "Risk per trade (% equity)", minval = 0.05, step = 0.05, group = gpRisk)
+slBufATR   = input.float(0.5, "SL buffer (x ATR)", minval = 0.0, step = 0.1, group = gpRisk,
+     tooltip = "Extra distance beyond swept extreme, scaled by ATR(14).")
+rrTp1      = input.float(1.0, "TP1 (R multiple)",       minval = 0.5, step = 0.1, group = gpRisk)
+tp1Pct     = input.float(50,  "Close at TP1 (%)",       minval = 0,   maxval = 100, group = gpRisk)
+rrTp2      = input.float(2.5, "TP2 (R multiple)",       minval = 0.5, step = 0.1, group = gpRisk)
+moveBE     = input.bool(true, "Move SL to break-even after TP1", group = gpRisk)
+maxTradesD = input.int(2,    "Max trades per day", minval = 1, group = gpRisk)
+maxDDPct   = input.float(3.0, "Daily loss lockout (% equity)", minval = 0.5, step = 0.5, group = gpRisk,
+     tooltip = "If equity drops by this % from the day's open equity, no more entries today.")
+
+// --- Visuals -----------------------------------------------------------------
+gpVis      = "6) Visuals"
+showSwings = input.bool(true,  "Show swing labels", group = gpVis)
+showStruct = input.bool(true,  "Show BOS / CHoCH",  group = gpVis)
+showSweeps = input.bool(true,  "Show sweep markers",group = gpVis)
+showZones  = input.bool(true,  "Show Premium/Discount zones", group = gpVis)
+showSesBg  = input.bool(true,  "Highlight active session", group = gpVis)
+sesBgCol   = input.color(color.new(color.yellow, 92), "Session background", group = gpVis)
+showDash   = input.bool(true,  "Show dashboard", group = gpVis)
+
+// =============================================================================
+//  2. SESSION & DAILY GATING
+// =============================================================================
+
+inLondon = not na(time(timeframe.period, sessLondon, sessTZ))
+inNY     = not na(time(timeframe.period, sessNY,     sessTZ))
+inSes    = (useLondon and inLondon) or (useNY and inNY)
+
+// `inSes` flips false the bar AFTER the session window ends -> use that to flag
+// "session just ended" so we can flatten any trade still open.
+sessionJustEnded = not inSes and inSes[1]
+
+// Background tint for active session.
+bgcolor(showSesBg and inSes ? sesBgCol : na, title = "Active session")
+
+// --- Daily reset & loss lockout ---------------------------------------------
+var int   tradesToday    = 0
+var float dayStartEquity = na
+var bool  lockedOutToday = false
+
+isNewDay = ta.change(dayofmonth) != 0
+if isNewDay
+    tradesToday    := 0
+    dayStartEquity := strategy.equity
+    lockedOutToday := false
+
+// Update daily DD lockout.
+if not na(dayStartEquity)
+    dailyPnlPct = (strategy.equity - dayStartEquity) / dayStartEquity * 100
+    if dailyPnlPct <= -maxDDPct
+        lockedOutToday := true
+
+canTradeToday = not lockedOutToday and tradesToday < maxTradesD
+
+// =============================================================================
+//  3. HTF BIAS
+// =============================================================================
+// We pull the HTF EMA via request.security with lookahead OFF and offset [1] to
+// avoid using a value that has not yet been confirmed on the higher timeframe.
+
+htfClose = request.security(syminfo.tickerid, htfBiasTF, close[1],
+     lookahead = barmerge.lookahead_off)
+htfEma   = request.security(syminfo.tickerid, htfBiasTF, ta.ema(close, htfEmaLen)[1],
+     lookahead = barmerge.lookahead_off)
+
+biasUp = useBias ? htfClose > htfEma : true
+biasDn = useBias ? htfClose < htfEma : true
+
+// =============================================================================
+//  4. SWINGS, STRUCTURE, SWEEPS  (compact SMC engine)
+// =============================================================================
+
+atr14 = ta.atr(14)
+ph    = ta.pivothigh(high, leftBars, rightBars)
+pl    = ta.pivotlow (low,  leftBars, rightBars)
+
+var float lastSH    = na
+var int   lastSHbar = na
+var float prevSH    = na
+var float lastSL    = na
+var int   lastSLbar = na
+var float prevSL    = na
+var int   trend     = 0   // +1 up, -1 down
+
+// Track confirmed swings.
+if not na(ph)
+    prevSH    := lastSH
+    lastSH    := ph
+    lastSHbar := bar_index - rightBars
+    if showSwings
+        isHH = not na(prevSH) and ph > prevSH
+        label.new(lastSHbar, ph, isHH ? "HH" : "LH",
+             style = label.style_label_down,
+             color = isHH ? color.new(#26a69a, 0) : color.new(#ef5350, 0),
+             textcolor = color.white, size = size.tiny, yloc = yloc.abovebar)
+
+if not na(pl)
+    prevSL    := lastSL
+    lastSL    := pl
+    lastSLbar := bar_index - rightBars
+    if showSwings
+        isHL = not na(prevSL) and pl > prevSL
+        label.new(lastSLbar, pl, isHL ? "HL" : "LL",
+             style = label.style_label_up,
+             color = isHL ? color.new(#26a69a, 0) : color.new(#ef5350, 0),
+             textcolor = color.white, size = size.tiny, yloc = yloc.belowbar)
+
+// Structure breaks. We CONSUME the broken swing (set to na) so we do not
+// repeatedly draw the same line while price floats past it.
+brokeUp = not na(lastSH) and barstate.isconfirmed and close > lastSH
+brokeDn = not na(lastSL) and barstate.isconfirmed and close < lastSL
+
+bosUp   = false
+bosDn   = false
+chochUp = false
+chochDn = false
+
+if brokeUp
+    if trend == 1
+        bosUp := true
+    else
+        chochUp := true
+        trend   := 1
+    if showStruct
+        line.new(lastSHbar, lastSH, bar_index, lastSH,
+             color = color.new(#26a69a, 0),
+             style = chochUp ? line.style_dashed : line.style_solid)
+        label.new(bar_index, lastSH, chochUp ? "CHoCH" : "BOS",
+             style = label.style_label_down,
+             color = color.new(#26a69a, 0),
+             textcolor = color.white, size = size.tiny, yloc = yloc.price)
+    lastSH    := na
+    lastSHbar := na
+
+if brokeDn
+    if trend == -1
+        bosDn := true
+    else
+        chochDn := true
+        trend   := -1
+    if showStruct
+        line.new(lastSLbar, lastSL, bar_index, lastSL,
+             color = color.new(#ef5350, 0),
+             style = chochDn ? line.style_dashed : line.style_solid)
+        label.new(bar_index, lastSL, chochDn ? "CHoCH" : "BOS",
+             style = label.style_label_up,
+             color = color.new(#ef5350, 0),
+             textcolor = color.white, size = size.tiny, yloc = yloc.price)
+    lastSL    := na
+    lastSLbar := na
+
+// --- Liquidity sweeps --------------------------------------------------------
+// We track the most recent confirmed swing (using prevSH/prevSL when current
+// got consumed by a break) and detect a wick + close-back-inside.
+
+float refHi = not na(lastSH) ? lastSH : prevSH
+int   refHiBar = not na(lastSHbar) ? lastSHbar : na
+float refLo = not na(lastSL) ? lastSL : prevSL
+int   refLoBar = not na(lastSLbar) ? lastSLbar : na
+
+sweepHigh = false
+sweepLow  = false
+var float sweptHighPx = na
+var float sweptLowPx  = na
+var int   sweepHighBar = na
+var int   sweepLowBar  = na
+
+if barstate.isconfirmed and not na(refHi)
+    if (na(refHiBar) or (bar_index - refHiBar) <= sweepLkbk) and high > refHi and close < refHi
+        sweepHigh    := true
+        sweptHighPx  := high
+        sweepHighBar := bar_index
+
+if barstate.isconfirmed and not na(refLo)
+    if (na(refLoBar) or (bar_index - refLoBar) <= sweepLkbk) and low < refLo and close > refLo
+        sweepLow    := true
+        sweptLowPx  := low
+        sweepLowBar := bar_index
+
+if showSweeps and sweepHigh
+    label.new(bar_index, high, "x", style = label.style_xcross,
+         color = color.new(#ab47bc, 0), textcolor = color.white,
+         size = size.tiny, yloc = yloc.abovebar)
+if showSweeps and sweepLow
+    label.new(bar_index, low, "x", style = label.style_xcross,
+         color = color.new(#42a5f5, 0), textcolor = color.white,
+         size = size.tiny, yloc = yloc.belowbar)
+
+// --- Premium / Discount ------------------------------------------------------
+float rangeHi = not na(lastSH) ? lastSH : prevSH
+float rangeLo = not na(lastSL) ? lastSL : prevSL
+float eq      = na
+inDiscount    = false
+inPremium     = false
+if not na(rangeHi) and not na(rangeLo) and rangeHi > rangeLo
+    eq := (rangeHi + rangeLo) / 2
+    inPremium  := close > eq
+    inDiscount := close < eq
+
+if showZones and not na(eq)
+    var line eqLn = na
+    if not na(eqLn)
+        line.delete(eqLn)
+    eqLn := line.new(bar_index - 50, eq, bar_index + 5, eq,
+         color = color.new(color.gray, 40), style = line.style_dashed,
+         extend = extend.right)
+
+// =============================================================================
+//  5. ENTRY ARMING & TRIGGER
+// =============================================================================
+// We "arm" a setup when a sweep prints, then wait for CHoCH on the same side
+// within `chochWin` bars. If it fires AND we are in session AND bias allows
+// AND zone allows AND risk gates pass -> we enter at market.
+
+var int   armBullBar = na     // sweep-low  bar (waiting for CHoCH up)
+var int   armBearBar = na     // sweep-high bar (waiting for CHoCH dn)
+var float armBullSL  = na     // pre-computed SL price for upcoming long
+var float armBearSL  = na     // pre-computed SL price for upcoming short
+
+if sweepLow
+    armBullBar := bar_index
+    armBullSL  := sweptLowPx - slBufATR * atr14
+if sweepHigh
+    armBearBar := bar_index
+    armBearSL  := sweptHighPx + slBufATR * atr14
+
+bullArmed = not na(armBullBar) and (bar_index - armBullBar) <= chochWin
+bearArmed = not na(armBearBar) and (bar_index - armBearBar) <= chochWin
+
+zoneOkLong  = needZone ? inDiscount : true
+zoneOkShort = needZone ? inPremium  : true
+
+flat = strategy.position_size == 0
+
+bullTrigger = barstate.isconfirmed and bullArmed and chochUp and biasUp
+              and zoneOkLong  and inSes and canTradeToday and flat
+bearTrigger = barstate.isconfirmed and bearArmed and chochDn and biasDn
+              and zoneOkShort and inSes and canTradeToday and flat
+
+// =============================================================================
+//  6. POSITION SIZING & ORDER EXECUTION
+// =============================================================================
+// Risk-based sizing: qty = (equity * risk%) / |entry - SL|.
+// We use limit/stop exits with two targets and partial close at TP1, then
+// shift the remaining stop to break-even when TP1 is hit.
+
+var float entryPx = na
+var float stopPx  = na
+var float tp1Px   = na
+var float tp2Px   = na
+var bool  tp1Done = false
+
+f_qty(float entry, float stop) =>
+    riskAmount = strategy.equity * (riskPct / 100)
+    dist       = math.abs(entry - stop)
+    dist > 0 ? riskAmount / dist : 0.0
+
+// --- Long entry --------------------------------------------------------------
+if bullTrigger
+    entryPx := close
+    stopPx  := armBullSL
+    rDist    = entryPx - stopPx
+    if rDist > 0
+        tp1Px := entryPx + rDist * rrTp1
+        tp2Px := entryPx + rDist * rrTp2
+        qty   = f_qty(entryPx, stopPx)
+        if qty > 0
+            strategy.entry("L", strategy.long, qty = qty,
+                 comment = "SMC Long")
+            tradesToday    += 1
+            tp1Done        := false
+            armBullBar     := na   // disarm
+            label.new(bar_index, low, "BUY",
+                 style = label.style_label_up,
+                 color = color.new(#00c853, 0),
+                 textcolor = color.white, size = size.normal,
+                 yloc = yloc.belowbar)
+
+// --- Short entry -------------------------------------------------------------
+if bearTrigger
+    entryPx := close
+    stopPx  := armBearSL
+    rDist    = stopPx - entryPx
+    if rDist > 0
+        tp1Px := entryPx - rDist * rrTp1
+        tp2Px := entryPx - rDist * rrTp2
+        qty   = f_qty(entryPx, stopPx)
+        if qty > 0
+            strategy.entry("S", strategy.short, qty = qty,
+                 comment = "SMC Short")
+            tradesToday    += 1
+            tp1Done        := false
+            armBearBar     := na   // disarm
+            label.new(bar_index, high, "SELL",
+                 style = label.style_label_down,
+                 color = color.new(#d50000, 0),
+                 textcolor = color.white, size = size.normal,
+                 yloc = yloc.abovebar)
+
+// --- Manage exits ------------------------------------------------------------
+// While in a long, place TP1 (partial) and TP2 (final) exits. After TP1 fills,
+// re-issue TP2 with stop at break-even.
+
+if strategy.position_size > 0
+    // Detect TP1 hit (price has reached tp1) -> move SL to BE.
+    if not tp1Done and not na(tp1Px) and high >= tp1Px
+        tp1Done := true
+        if moveBE
+            stopPx := strategy.position_avg_price
+    // Issue / refresh exits each bar while in trade.
+    strategy.exit("L-TP1", from_entry = "L",
+         limit = tp1Px, stop = stopPx, qty_percent = tp1Pct)
+    strategy.exit("L-TP2", from_entry = "L",
+         limit = tp2Px, stop = stopPx)
+
+if strategy.position_size < 0
+    if not tp1Done and not na(tp1Px) and low <= tp1Px
+        tp1Done := true
+        if moveBE
+            stopPx := strategy.position_avg_price
+    strategy.exit("S-TP1", from_entry = "S",
+         limit = tp1Px, stop = stopPx, qty_percent = tp1Pct)
+    strategy.exit("S-TP2", from_entry = "S",
+         limit = tp2Px, stop = stopPx)
+
+// Flatten at session end if requested.
+if closeOnEnd and sessionJustEnded and strategy.position_size != 0
+    strategy.close_all(comment = "Session end")
+
+// Reset exit-tracking state when flat.
+if strategy.position_size == 0
+    entryPx := na
+    stopPx  := na
+    tp1Px   := na
+    tp2Px   := na
+    tp1Done := false
+
+// =============================================================================
+//  7. PLOT LIVE LEVELS
+// =============================================================================
+// Visual aid: while in trade, show entry / SL / TP1 / TP2 lines.
+
+plot(strategy.position_size != 0 ? entryPx : na, "Entry",
+     color = color.new(color.white, 0), style = plot.style_linebr, linewidth = 1)
+plot(strategy.position_size != 0 ? stopPx : na,  "SL",
+     color = color.new(#ef5350, 0),    style = plot.style_linebr, linewidth = 2)
+plot(strategy.position_size != 0 ? tp1Px : na,   "TP1",
+     color = color.new(#26a69a, 0),    style = plot.style_linebr, linewidth = 1)
+plot(strategy.position_size != 0 ? tp2Px : na,   "TP2",
+     color = color.new(#26a69a, 0),    style = plot.style_linebr, linewidth = 2)
+
+// =============================================================================
+//  8. DASHBOARD
+// =============================================================================
+var table dash = table.new(position.top_right, 2, 9,
+     bgcolor = color.new(color.black, 80),
+     border_width = 1, border_color = color.new(color.gray, 60))
+
+f_cell(int r, int c, string txt, color bg, color fg) =>
+    table.cell(dash, c, r, txt, bgcolor = bg, text_color = fg, text_size = size.small)
+
+if showDash and barstate.islast
+    sesTxt   = inLondon and useLondon ? "LONDON KZ" :
+               inNY     and useNY     ? "NY KZ"     :
+               inSes                  ? "SESSION"   : "OUT OF SESSION"
+    sesCol   = inSes ? color.new(#ffb300, 30) : color.new(color.gray, 50)
+    biasTxt  = not useBias ? "OFF" : biasUp ? "BULLISH" : biasDn ? "BEARISH" : "FLAT"
+    biasCol  = not useBias ? color.gray : biasUp ? color.new(#26a69a, 0) : color.new(#ef5350, 0)
+    trendTxt = trend == 1 ? "UP" : trend == -1 ? "DOWN" : "-"
+    zoneTxt  = inDiscount ? "DISCOUNT" : inPremium ? "PREMIUM" : "-"
+    posTxt   = strategy.position_size > 0 ? "LONG" :
+               strategy.position_size < 0 ? "SHORT" : "FLAT"
+    posCol   = strategy.position_size > 0 ? color.new(#26a69a, 0) :
+               strategy.position_size < 0 ? color.new(#ef5350, 0) : color.gray
+    lockTxt  = lockedOutToday ? "LOCKED" : canTradeToday ? "OK" : "MAX TRADES"
+    lockCol  = lockedOutToday ? color.new(#d50000, 0) :
+               canTradeToday   ? color.new(#26a69a, 0) : color.new(#ffb300, 0)
+
+    f_cell(0, 0, "SMC NY/LDN",            color.new(color.black, 30), color.white)
+    f_cell(0, 1, syminfo.ticker + " " + timeframe.period,
+                                          color.new(color.black, 30), color.white)
+    f_cell(1, 0, "Session",               color.new(color.black, 50), color.white)
+    f_cell(1, 1, sesTxt,                  sesCol,                     color.white)
+    f_cell(2, 0, "HTF Bias",              color.new(color.black, 50), color.white)
+    f_cell(2, 1, biasTxt,                 biasCol,                    color.white)
+    f_cell(3, 0, "Trend (LTF)",           color.new(color.black, 50), color.white)
+    f_cell(3, 1, trendTxt,                color.new(color.black, 50), color.white)
+    f_cell(4, 0, "Zone",                  color.new(color.black, 50), color.white)
+    f_cell(4, 1, zoneTxt,                 color.new(color.black, 50), color.white)
+    f_cell(5, 0, "Position",              color.new(color.black, 50), color.white)
+    f_cell(5, 1, posTxt,                  posCol,                     color.white)
+    f_cell(6, 0, "Trades today",          color.new(color.black, 50), color.white)
+    f_cell(6, 1, str.tostring(tradesToday) + " / " + str.tostring(maxTradesD),
+                                          color.new(color.black, 50), color.white)
+    f_cell(7, 0, "Daily status",          color.new(color.black, 50), color.white)
+    f_cell(7, 1, lockTxt,                 lockCol,                    color.white)
+    f_cell(8, 0, "Equity",                color.new(color.black, 50), color.white)
+    f_cell(8, 1, str.tostring(strategy.equity, format.mintick),
+                                          color.new(color.black, 50), color.white)
+
+// =============================================================================
+//  9. ALERTS
+// =============================================================================
+alertcondition(bullTrigger, title = "SMC Long Entry",
+     message = "{{ticker}} {{interval}} - SMC Long entry triggered")
+alertcondition(bearTrigger, title = "SMC Short Entry",
+     message = "{{ticker}} {{interval}} - SMC Short entry triggered")
+alertcondition(sessionJustEnded and strategy.position_size != 0,
+     title = "Session End - Flatten",
+     message = "{{ticker}} {{interval}} - Session ended, flattening position")

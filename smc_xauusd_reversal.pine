@@ -1,0 +1,689 @@
+// =============================================================================
+//  SMC XAUUSD Reversal Pro  -  Smart Money Concepts Reversal Indicator
+//  Pine Script v5  |  Overlay  |  Tuned for XAUUSD (Gold)
+// =============================================================================
+//  WHAT THIS INDICATOR DOES
+//  ------------------------
+//  A complete Smart Money Concepts toolkit focused on REVERSAL detection:
+//    1.  Swing Points         -> HH / HL / LH / LL classification (non-repaint)
+//    2.  Market Structure     -> BOS (Break of Structure) & CHoCH (Change of
+//                                Character) with on-chart trend tracking
+//    3.  Order Blocks         -> Last opposite candle before a structural break
+//                                (bullish OB and bearish OB) drawn as boxes
+//    4.  Fair Value Gaps      -> 3-candle imbalances (FVG) auto-mitigated
+//    5.  Liquidity Pools      -> Recent equal/major highs and lows
+//    6.  Liquidity Sweeps     -> Stop-hunt detection above highs / below lows
+//    7.  Premium / Discount   -> Range equilibrium between last HH and LL
+//    8.  Reversal Signal      -> Confluence: sweep + CHoCH/FVG/OB tap in
+//                                premium (short) or discount (long) zone
+//    9.  Dashboard            -> Live state panel (trend, zone, last signal)
+//   10.  Alerts               -> One alert per signal type, ready to wire up
+//
+//  WHY IT IS NON-REPAINTING
+//  ------------------------
+//  All structural objects (swings, OBs, FVGs, sweeps, signals) are evaluated
+//  using `ta.pivothigh` / `ta.pivotlow` which only confirm AFTER `rightBars`
+//  candles close to the right of the pivot, and using `barstate.isconfirmed`
+//  for signal candles. Once an object is drawn, it stays put.
+//
+//  TUNED FOR XAUUSD (GOLD)
+//  -----------------------
+//  Defaults assume gold-like volatility. The minimum FVG / sweep filters use
+//  ATR (not fixed pips) so the script self-adapts to whatever timeframe and
+//  symbol you load it on. Recommended timeframes: M15, H1, H4.
+// =============================================================================
+
+//@version=5
+indicator(
+     title             = "SMC XAUUSD Reversal Pro",
+     shorttitle        = "SMC Reversal",
+     overlay           = true,
+     max_labels_count  = 500,
+     max_lines_count   = 500,
+     max_boxes_count   = 500
+ )
+
+// =============================================================================
+//  1. INPUTS
+// =============================================================================
+
+// --- Swing detection ---------------------------------------------------------
+grpSw       = "1) Swings"
+leftBars    = input.int(5,  "Pivot Left Bars",  minval = 1, group = grpSw,
+     tooltip = "Bars to the LEFT of a pivot. Higher = stronger but slower swings.")
+rightBars   = input.int(5,  "Pivot Right Bars", minval = 1, group = grpSw,
+     tooltip = "Bars to the RIGHT of a pivot. The pivot is confirmed only after "
+             + "this many bars close. This is what makes the script non-repainting.")
+showSwings  = input.bool(true, "Show HH / HL / LH / LL labels", group = grpSw)
+
+// --- Market Structure --------------------------------------------------------
+grpMs       = "2) Market Structure"
+showBOS     = input.bool(true, "Show BOS lines",   group = grpMs,
+     tooltip = "Break of Structure: continuation of the current trend.")
+showCHoCH   = input.bool(true, "Show CHoCH lines", group = grpMs,
+     tooltip = "Change of Character: first sign of a trend reversal.")
+bosColorUp  = input.color(color.new(#26a69a, 0), "Bullish Structure", group = grpMs, inline = "msc")
+bosColorDn  = input.color(color.new(#ef5350, 0), "Bearish Structure", group = grpMs, inline = "msc")
+
+// --- Order Blocks ------------------------------------------------------------
+grpOb       = "3) Order Blocks"
+showOB      = input.bool(true, "Show Order Blocks", group = grpOb)
+maxOB       = input.int(5, "Max OBs per side", minval = 1, maxval = 20, group = grpOb,
+     tooltip = "Older order blocks are auto-removed when this limit is exceeded.")
+mitigateOB  = input.string("Wick", "Mitigate OB by", options = ["Wick", "Close"], group = grpOb,
+     tooltip = "Wick: OB is mitigated when any wick taps it. Close: only on a candle close inside.")
+obBullCol   = input.color(color.new(#26a69a, 80), "Bull OB Fill", group = grpOb, inline = "obc")
+obBearCol   = input.color(color.new(#ef5350, 80), "Bear OB Fill", group = grpOb, inline = "obc")
+
+// --- Fair Value Gaps ---------------------------------------------------------
+grpFvg      = "4) Fair Value Gaps"
+showFVG     = input.bool(true, "Show Fair Value Gaps", group = grpFvg)
+maxFVG      = input.int(8, "Max FVGs per side", minval = 1, maxval = 20, group = grpFvg)
+minFvgAtr   = input.float(0.25, "Min FVG size (x ATR)", minval = 0.0, step = 0.05, group = grpFvg,
+     tooltip = "Filters out tiny gaps. 0 = show every imbalance.")
+fvgBullCol  = input.color(color.new(#26a69a, 75), "Bull FVG Fill", group = grpFvg, inline = "fvc")
+fvgBearCol  = input.color(color.new(#ef5350, 75), "Bear FVG Fill", group = grpFvg, inline = "fvc")
+
+// --- Liquidity ---------------------------------------------------------------
+grpLq       = "5) Liquidity"
+showLiq     = input.bool(true, "Show Liquidity Levels", group = grpLq)
+showSweeps  = input.bool(true, "Show Liquidity Sweeps", group = grpLq,
+     tooltip = "Detects when price wicks above a recent swing high (or below a swing low) "
+             + "and then closes back inside - a classic stop-hunt.")
+liqBullCol  = input.color(color.new(#42a5f5, 0),  "Buy-side Liquidity",  group = grpLq, inline = "lqc")
+liqBearCol  = input.color(color.new(#ab47bc, 0),  "Sell-side Liquidity", group = grpLq, inline = "lqc")
+
+// --- Premium / Discount ------------------------------------------------------
+grpPd       = "6) Premium / Discount"
+showPD      = input.bool(true, "Show Premium / Discount Zones", group = grpPd,
+     tooltip = "Range from last HH down to last LL. Top half = Premium (look for shorts), "
+             + "bottom half = Discount (look for longs).")
+premCol     = input.color(color.new(#ef5350, 88), "Premium Fill",     group = grpPd, inline = "pdc")
+eqCol       = input.color(color.new(#9e9e9e, 70), "Equilibrium Line", group = grpPd, inline = "pdc")
+discCol     = input.color(color.new(#26a69a, 88), "Discount Fill",    group = grpPd, inline = "pdc")
+
+// --- Reversal Signal ---------------------------------------------------------
+grpSig      = "7) Reversal Signal"
+showSignal  = input.bool(true, "Show Reversal Arrows", group = grpSig)
+needSweep   = input.bool(true, "Require Liquidity Sweep", group = grpSig,
+     tooltip = "Reversal must be preceded by a sweep of the recent swing high/low.")
+needChoch   = input.bool(true, "Require CHoCH",            group = grpSig,
+     tooltip = "Reversal must be confirmed by a Change of Character on the same side.")
+needZone    = input.bool(true, "Require Premium/Discount", group = grpSig,
+     tooltip = "Bullish reversal must occur in Discount; bearish reversal in Premium.")
+sweepLookbk = input.int(20, "Sweep Lookback (bars)", minval = 3, group = grpSig,
+     tooltip = "How far back to look for the swing being swept.")
+chochWindow = input.int(20, "CHoCH Confirm Window (bars)", minval = 1, group = grpSig,
+     tooltip = "Sweep must be followed by CHoCH within this many bars.")
+
+// --- Dashboard ---------------------------------------------------------------
+grpDb       = "8) Dashboard"
+showDash    = input.bool(true, "Show Dashboard", group = grpDb)
+dashPos     = input.string("top_right", "Position",
+     options = ["top_right", "top_left", "bottom_right", "bottom_left", "middle_right"], group = grpDb)
+dashSize    = input.string("normal", "Size", options = ["tiny", "small", "normal", "large"], group = grpDb)
+
+// --- Alerts ------------------------------------------------------------------
+grpAl       = "9) Alerts"
+alertBOS    = input.bool(true, "Alert on BOS",                group = grpAl)
+alertCHoCH  = input.bool(true, "Alert on CHoCH",              group = grpAl)
+alertSweep  = input.bool(true, "Alert on Liquidity Sweep",    group = grpAl)
+alertRev    = input.bool(true, "Alert on Reversal Signal",    group = grpAl)
+
+// =============================================================================
+//  2. HELPERS
+// =============================================================================
+
+// ATR is used to filter noise on instruments with very different volatility.
+// Gold on H1 typically has ATR ~3-6 USD, on M15 ~1-2 USD. Using ATR keeps the
+// minimum FVG size meaningful across timeframes without re-tuning.
+atr14 = ta.atr(14)
+
+// Convert dashboard position string -> position constant.
+posDash = dashPos == "top_left"      ? position.top_left      :
+          dashPos == "top_right"     ? position.top_right     :
+          dashPos == "bottom_left"   ? position.bottom_left   :
+          dashPos == "bottom_right"  ? position.bottom_right  :
+          dashPos == "middle_right"  ? position.middle_right  : position.top_right
+
+sizeDash = dashSize == "tiny"   ? size.tiny   :
+           dashSize == "small"  ? size.small  :
+           dashSize == "large"  ? size.large  : size.normal
+
+// =============================================================================
+//  3. SWING DETECTION (non-repaint via right-side confirmation)
+// =============================================================================
+// `ta.pivothigh` / `ta.pivotlow` return the pivot value when a pivot is
+// confirmed (i.e. `rightBars` candles after the actual pivot bar). At that
+// moment we are AT bar `bar_index`, but the pivot is at bar
+// `bar_index - rightBars`, with price `ph` / `pl`.
+
+ph = ta.pivothigh(high, leftBars, rightBars)
+pl = ta.pivotlow(low,  leftBars, rightBars)
+
+// Persistent trackers - the "memory" of price action.
+var float lastSwHigh    = na
+var int   lastSwHighBar = na
+var float prevSwHigh    = na     // previous swing high (for HH/LH classification)
+var float lastSwLow     = na
+var int   lastSwLowBar  = na
+var float prevSwLow     = na
+
+// Trend: +1 bullish, -1 bearish, 0 undefined
+var int   trend         = 0
+var int   prevTrend     = 0
+
+// Last signal text for the dashboard
+var string lastSignal   = "-"
+var int    lastSigBar   = na
+
+// --- New swing high confirmed -----------------------------------------------
+isNewSH = not na(ph)
+if isNewSH
+    prevSwHigh    := lastSwHigh
+    lastSwHigh    := ph
+    lastSwHighBar := bar_index - rightBars
+
+    if showSwings
+        // HH if higher than the previous swing high, otherwise LH.
+        isHH = not na(prevSwHigh) and ph > prevSwHigh
+        label.new(
+             x         = lastSwHighBar,
+             y         = ph,
+             text      = isHH ? "HH" : "LH",
+             style     = label.style_label_down,
+             color     = isHH ? color.new(#26a69a, 0) : color.new(#ef5350, 0),
+             textcolor = color.white,
+             size      = size.small,
+             yloc      = yloc.abovebar
+         )
+
+// --- New swing low confirmed -------------------------------------------------
+isNewSL = not na(pl)
+if isNewSL
+    prevSwLow    := lastSwLow
+    lastSwLow    := pl
+    lastSwLowBar := bar_index - rightBars
+
+    if showSwings
+        isHL = not na(prevSwLow) and pl > prevSwLow
+        label.new(
+             x         = lastSwLowBar,
+             y         = pl,
+             text      = isHL ? "HL" : "LL",
+             style     = label.style_label_up,
+             color     = isHL ? color.new(#26a69a, 0) : color.new(#ef5350, 0),
+             textcolor = color.white,
+             size      = size.small,
+             yloc      = yloc.belowbar
+         )
+
+// =============================================================================
+//  4. MARKET STRUCTURE (BOS / CHoCH)
+// =============================================================================
+// BOS  : continuation of the existing trend
+//        - Bullish BOS  when, in an UPTREND, close > lastSwHigh
+//        - Bearish BOS  when, in a DOWNTREND, close < lastSwLow
+// CHoCH: first break against the existing trend (the early reversal cue)
+//        - Bullish CHoCH when, in a DOWNTREND, close > lastSwHigh -> trend flips up
+//        - Bearish CHoCH when, in an  UPTREND, close < lastSwLow  -> trend flips dn
+//
+// We "consume" the broken swing by clearing it so we do not draw the same line
+// repeatedly while price floats above/below it.
+
+prevTrend := trend
+brokeUp   = not na(lastSwHigh) and close > lastSwHigh and barstate.isconfirmed
+brokeDn   = not na(lastSwLow)  and close < lastSwLow  and barstate.isconfirmed
+
+bosUp   = false
+bosDn   = false
+chochUp = false
+chochDn = false
+
+if brokeUp
+    if trend == 1
+        bosUp := true
+    else
+        chochUp := true
+        trend   := 1
+    if showBOS or showCHoCH
+        col = chochUp ? bosColorUp : bosColorUp
+        sty = chochUp ? line.style_dashed : line.style_solid
+        line.new(lastSwHighBar, lastSwHigh, bar_index, lastSwHigh,
+             color = col, style = sty, width = 1)
+        label.new(
+             x         = math.round((lastSwHighBar + bar_index) / 2),
+             y         = lastSwHigh,
+             text      = chochUp ? "CHoCH" : "BOS",
+             style     = label.style_label_down,
+             color     = bosColorUp,
+             textcolor = color.white,
+             size      = size.small,
+             yloc      = yloc.price
+         )
+    // Consume the broken swing.
+    lastSwHigh    := na
+    lastSwHighBar := na
+
+if brokeDn
+    if trend == -1
+        bosDn := true
+    else
+        chochDn := true
+        trend   := -1
+    if showBOS or showCHoCH
+        col = chochDn ? bosColorDn : bosColorDn
+        sty = chochDn ? line.style_dashed : line.style_solid
+        line.new(lastSwLowBar, lastSwLow, bar_index, lastSwLow,
+             color = col, style = sty, width = 1)
+        label.new(
+             x         = math.round((lastSwLowBar + bar_index) / 2),
+             y         = lastSwLow,
+             text      = chochDn ? "CHoCH" : "BOS",
+             style     = label.style_label_up,
+             color     = bosColorDn,
+             textcolor = color.white,
+             size      = size.small,
+             yloc      = yloc.price
+         )
+    lastSwLow    := na
+    lastSwLowBar := na
+
+// =============================================================================
+//  5. ORDER BLOCKS
+// =============================================================================
+// A bullish order block is the LAST DOWN-CLOSE candle that happened before the
+// impulsive move which broke structure to the upside. Mirror logic for bear.
+//
+// We scan back from the current bar (where the break is confirmed) until we
+// find a candle of the OPPOSITE color, capture its high/low, and draw a box
+// extending forward until it gets mitigated.
+
+var box[] bullOBs = array.new<box>()
+var box[] bearOBs = array.new<box>()
+
+// findOB(direction) -> [obTop, obBottom, obBar]
+//   direction =  1 -> looking for last DOWN-close candle (bullish OB)
+//   direction = -1 -> looking for last UP-close   candle (bearish OB)
+findOB(int direction) =>
+    float obTop = na
+    float obBot = na
+    int   obBar = na
+    // Look back up to 30 bars to find the last opposite candle.
+    for i = 0 to 30
+        bClose = close[i]
+        bOpen  = open[i]
+        isDown = bClose < bOpen
+        isUp   = bClose > bOpen
+        if (direction == 1 and isDown) or (direction == -1 and isUp)
+            obTop := high[i]
+            obBot := low[i]
+            obBar := bar_index - i
+            break
+    [obTop, obBot, obBar]
+
+// Mitigation check: returns true if the OB has been tapped/closed-into.
+mitigated(box b, bool isBull) =>
+    float t = box.get_top(b)
+    float bo = box.get_bottom(b)
+    if mitigateOB == "Wick"
+        isBull ? low <= t  and low >= bo  or (low < bo and high > bo)
+               : high >= bo and high <= t or (high > t and low < t)
+    else
+        isBull ? close <= t and close >= bo
+               : close >= bo and close <= t
+
+// Drop mitigated boxes and trim to maxOB.
+cleanupOBs(box[] arr, bool isBull) =>
+    if array.size(arr) > 0
+        for i = array.size(arr) - 1 to 0
+            b = array.get(arr, i)
+            if mitigated(b, isBull)
+                box.delete(b)
+                array.remove(arr, i)
+    while array.size(arr) > maxOB
+        old = array.shift(arr)
+        box.delete(old)
+
+// Create OBs at structure breaks.
+if showOB and (bosUp or chochUp)
+    [t, b, br] = findOB(1)
+    if not na(t) and not na(b)
+        nb = box.new(br, t, bar_index + 10, b,
+             bgcolor = obBullCol,
+             border_color = color.new(#26a69a, 40),
+             border_width = 1,
+             extend = extend.right,
+             text  = chochUp ? "Bull OB+" : "Bull OB",
+             text_size  = size.tiny,
+             text_color = color.white,
+             text_halign = text.align_left,
+             text_valign = text.align_center)
+        array.push(bullOBs, nb)
+
+if showOB and (bosDn or chochDn)
+    [t, b, br] = findOB(-1)
+    if not na(t) and not na(b)
+        nb = box.new(br, t, bar_index + 10, b,
+             bgcolor = obBearCol,
+             border_color = color.new(#ef5350, 40),
+             border_width = 1,
+             extend = extend.right,
+             text  = chochDn ? "Bear OB+" : "Bear OB",
+             text_size  = size.tiny,
+             text_color = color.white,
+             text_halign = text.align_left,
+             text_valign = text.align_center)
+        array.push(bearOBs, nb)
+
+if showOB
+    cleanupOBs(bullOBs, true)
+    cleanupOBs(bearOBs, false)
+
+// =============================================================================
+//  6. FAIR VALUE GAPS (FVG)
+// =============================================================================
+// A 3-candle imbalance:
+//   Bullish FVG: low[0] > high[2]   ->  gap between high[2] (bottom) and low[0] (top)
+//   Bearish FVG: high[0] < low[2]   ->  gap between high[0] (top)    and low[2] (bottom)
+// The "middle" candle [1] is the one that produced the imbalance.
+
+var box[] bullFVGs = array.new<box>()
+var box[] bearFVGs = array.new<box>()
+
+bullFVG = low > high[2]
+bearFVG = high < low[2]
+fvgSize = bullFVG ? low - high[2] : bearFVG ? low[2] - high : 0.0
+minSize = minFvgAtr * atr14
+
+if showFVG and barstate.isconfirmed and bullFVG and fvgSize >= minSize
+    nb = box.new(bar_index - 2, low, bar_index + 10, high[2],
+         bgcolor = fvgBullCol,
+         border_color = color.new(#26a69a, 60),
+         border_width = 1,
+         extend = extend.right)
+    array.push(bullFVGs, nb)
+
+if showFVG and barstate.isconfirmed and bearFVG and fvgSize >= minSize
+    nb = box.new(bar_index - 2, high, bar_index + 10, low[2],
+         bgcolor = fvgBearCol,
+         border_color = color.new(#ef5350, 60),
+         border_width = 1,
+         extend = extend.right)
+    array.push(bearFVGs, nb)
+
+// FVG mitigation: filled when price trades back through it.
+cleanupFVGs(box[] arr, bool isBull) =>
+    if array.size(arr) > 0
+        for i = array.size(arr) - 1 to 0
+            b = array.get(arr, i)
+            t = box.get_top(b)
+            bo = box.get_bottom(b)
+            filled = isBull ? low <= bo : high >= t
+            if filled
+                box.delete(b)
+                array.remove(arr, i)
+    while array.size(arr) > maxFVG
+        old = array.shift(arr)
+        box.delete(old)
+
+if showFVG
+    cleanupFVGs(bullFVGs, true)
+    cleanupFVGs(bearFVGs, false)
+
+// =============================================================================
+//  7. LIQUIDITY POOLS & SWEEPS
+// =============================================================================
+// Liquidity sits ABOVE recent swing highs (buy-stops) and BELOW recent swing
+// lows (sell-stops). Smart money harvests it via "sweeps":
+//   - Bearish sweep (sweep of high): high > recentSwHigh AND close < recentSwHigh
+//   - Bullish sweep (sweep of low ): low  < recentSwLow  AND close > recentSwLow
+
+// Track up to N recent confirmed swings using simple buffers.
+var float[] recentHighs    = array.new<float>()
+var int  [] recentHighBars = array.new<int>()
+var float[] recentLows     = array.new<float>()
+var int  [] recentLowBars  = array.new<int>()
+
+if isNewSH
+    array.push(recentHighs,    ph)
+    array.push(recentHighBars, bar_index - rightBars)
+    if array.size(recentHighs) > 10
+        array.shift(recentHighs)
+        array.shift(recentHighBars)
+
+if isNewSL
+    array.push(recentLows,    pl)
+    array.push(recentLowBars, bar_index - rightBars)
+    if array.size(recentLows) > 10
+        array.shift(recentLows)
+        array.shift(recentLowBars)
+
+// Draw thin liquidity lines from each recent swing forward to current bar.
+var line[] liqLinesUp = array.new<line>()
+var line[] liqLinesDn = array.new<line>()
+
+if showLiq and isNewSH
+    ln = line.new(bar_index - rightBars, ph, bar_index + 5, ph,
+         color = liqBullCol, style = line.style_dotted, width = 1,
+         extend = extend.right)
+    array.push(liqLinesUp, ln)
+    while array.size(liqLinesUp) > 6
+        old = array.shift(liqLinesUp)
+        line.delete(old)
+
+if showLiq and isNewSL
+    ln = line.new(bar_index - rightBars, pl, bar_index + 5, pl,
+         color = liqBearCol, style = line.style_dotted, width = 1,
+         extend = extend.right)
+    array.push(liqLinesDn, ln)
+    while array.size(liqLinesDn) > 6
+        old = array.shift(liqLinesDn)
+        line.delete(old)
+
+// Sweep detection on the current confirmed bar.
+sweepHigh = false
+sweepLow  = false
+var float lastSweptHigh   = na
+var int   lastSweepHighBar = na
+var float lastSweptLow    = na
+var int   lastSweepLowBar  = na
+
+if barstate.isconfirmed and array.size(recentHighs) > 0
+    rh = array.get(recentHighs, array.size(recentHighs) - 1)
+    rhBar = array.get(recentHighBars, array.size(recentHighBars) - 1)
+    if (bar_index - rhBar) <= sweepLookbk and high > rh and close < rh
+        sweepHigh        := true
+        lastSweptHigh    := rh
+        lastSweepHighBar := bar_index
+
+if barstate.isconfirmed and array.size(recentLows) > 0
+    rl = array.get(recentLows, array.size(recentLows) - 1)
+    rlBar = array.get(recentLowBars, array.size(recentLowBars) - 1)
+    if (bar_index - rlBar) <= sweepLookbk and low < rl and close > rl
+        sweepLow        := true
+        lastSweptLow    := rl
+        lastSweepLowBar := bar_index
+
+if showSweeps and sweepHigh
+    label.new(bar_index, high, "SWEEP",
+         style = label.style_label_down,
+         color = liqBearCol,
+         textcolor = color.white,
+         size = size.tiny,
+         yloc = yloc.abovebar)
+
+if showSweeps and sweepLow
+    label.new(bar_index, low, "SWEEP",
+         style = label.style_label_up,
+         color = liqBullCol,
+         textcolor = color.white,
+         size = size.tiny,
+         yloc = yloc.belowbar)
+
+// =============================================================================
+//  8. PREMIUM / DISCOUNT / EQUILIBRIUM
+// =============================================================================
+// Range = (most recent confirmed swing high) to (most recent confirmed swing low).
+// We need at least one of each. We use the most recent values regardless of
+// whether they have been "consumed" by structure breaks - so we fall back to
+// `prevSwHigh`/`prevSwLow` if needed.
+
+float rangeHi = not na(lastSwHigh) ? lastSwHigh : prevSwHigh
+float rangeLo = not na(lastSwLow)  ? lastSwLow  : prevSwLow
+
+float eq      = na
+float premLo  = na
+float discHi  = na
+inPremium     = false
+inDiscount    = false
+inEq          = false
+
+if not na(rangeHi) and not na(rangeLo) and rangeHi > rangeLo
+    eq     := (rangeHi + rangeLo) / 2
+    premLo := eq + (rangeHi - eq) * 0.25     // 62.5% - 100%  zone center
+    discHi := eq - (eq - rangeLo) * 0.25     // 0%    - 37.5% zone center
+    inPremium  := close > eq
+    inDiscount := close < eq
+    inEq       := math.abs(close - eq) < (rangeHi - rangeLo) * 0.05
+
+// Draw P/D zones as boxes that extend right.
+var box premBox = na
+var box discBox = na
+var line eqLine = na
+
+if showPD and not na(eq)
+    leftX = math.min(nz(lastSwHighBar, bar_index - 50), nz(lastSwLowBar, bar_index - 50))
+    if not na(premBox)
+        box.delete(premBox)
+    if not na(discBox)
+        box.delete(discBox)
+    if not na(eqLine)
+        line.delete(eqLine)
+    premBox := box.new(leftX, rangeHi, bar_index + 10, eq,
+         bgcolor = premCol, border_color = color.new(color.red, 80), extend = extend.right)
+    discBox := box.new(leftX, eq, bar_index + 10, rangeLo,
+         bgcolor = discCol, border_color = color.new(color.green, 80), extend = extend.right)
+    eqLine := line.new(leftX, eq, bar_index + 10, eq,
+         color = eqCol, style = line.style_dashed, extend = extend.right)
+
+// =============================================================================
+//  9. REVERSAL SIGNAL  (the main confluence trigger)
+// =============================================================================
+// Bullish reversal:
+//   1) sweep of recent low                            (liquidity grab)
+//   2) followed by CHoCH up within `chochWindow` bars (structure flip)
+//   3) optionally requires price to be in Discount    (institutional buy zone)
+//
+// Bearish reversal: mirror.
+//
+// We track the most recent sweep bar and arm the signal until the CHoCH fires.
+
+var int  armedBullBar = na    // bar where a sweep-low fired (waiting for CHoCH up)
+var int  armedBearBar = na    // bar where a sweep-high fired (waiting for CHoCH dn)
+
+if sweepLow
+    armedBullBar := bar_index
+if sweepHigh
+    armedBearBar := bar_index
+
+// Optional: if user does not require sweep, we always treat signal as armed.
+bullArmed = needSweep ? (not na(armedBullBar) and (bar_index - armedBullBar) <= chochWindow) : true
+bearArmed = needSweep ? (not na(armedBearBar) and (bar_index - armedBearBar) <= chochWindow) : true
+
+// Optional: require CHoCH this bar.
+bullStruct = needChoch ? chochUp : (chochUp or bosUp)
+bearStruct = needChoch ? chochDn : (chochDn or bosDn)
+
+// Optional: require correct premium/discount zone.
+bullZone = needZone ? (inDiscount or inEq) : true
+bearZone = needZone ? (inPremium  or inEq) : true
+
+bullReversal = barstate.isconfirmed and bullArmed and bullStruct and bullZone
+bearReversal = barstate.isconfirmed and bearArmed and bearStruct and bearZone
+
+// Disarm once fired so we do not re-trigger on the same setup.
+if bullReversal
+    armedBullBar := na
+    lastSignal   := "BULL REVERSAL"
+    lastSigBar   := bar_index
+if bearReversal
+    armedBearBar := na
+    lastSignal   := "BEAR REVERSAL"
+    lastSigBar   := bar_index
+
+if showSignal and bullReversal
+    label.new(bar_index, low, "BUY",
+         style = label.style_label_up,
+         color = color.new(#00c853, 0),
+         textcolor = color.white,
+         size = size.normal,
+         yloc = yloc.belowbar)
+
+if showSignal and bearReversal
+    label.new(bar_index, high, "SELL",
+         style = label.style_label_down,
+         color = color.new(#d50000, 0),
+         textcolor = color.white,
+         size = size.normal,
+         yloc = yloc.abovebar)
+
+plotshape(bullReversal, title = "Bull Reversal Marker", style = shape.triangleup,
+     location = location.belowbar, color = color.new(#00c853, 0), size = size.tiny)
+plotshape(bearReversal, title = "Bear Reversal Marker", style = shape.triangledown,
+     location = location.abovebar, color = color.new(#d50000, 0), size = size.tiny)
+
+// =============================================================================
+//  10. DASHBOARD
+// =============================================================================
+var table dash = table.new(posDash, 2, 7,
+     bgcolor      = color.new(color.black, 80),
+     border_width = 1,
+     border_color = color.new(color.gray, 60),
+     frame_width  = 1,
+     frame_color  = color.new(color.gray, 60))
+
+f_cell(int r, int c, string txt, color bg, color fg) =>
+    table.cell(dash, c, r, txt, bgcolor = bg, text_color = fg, text_size = sizeDash)
+
+if showDash and barstate.islast
+    trendTxt = trend ==  1 ? "BULLISH" : trend == -1 ? "BEARISH" : "NEUTRAL"
+    trendCol = trend ==  1 ? color.new(#26a69a, 0) : trend == -1 ? color.new(#ef5350, 0) : color.gray
+    zoneTxt  = inPremium ? "PREMIUM" : inDiscount ? "DISCOUNT" : "EQUILIBRIUM"
+    zoneCol  = inPremium ? color.new(#ef5350, 30) : inDiscount ? color.new(#26a69a, 30) : color.new(color.gray, 30)
+    sigCol   = lastSignal == "BULL REVERSAL" ? color.new(#00c853, 0) :
+               lastSignal == "BEAR REVERSAL" ? color.new(#d50000, 0) : color.new(color.gray, 0)
+    sigBars  = na(lastSigBar) ? "-" : str.tostring(bar_index - lastSigBar) + " bars ago"
+
+    f_cell(0, 0, "SMC XAUUSD",        color.new(color.black, 30), color.white)
+    f_cell(0, 1, syminfo.ticker,      color.new(color.black, 30), color.white)
+    f_cell(1, 0, "Trend",             color.new(color.black, 50), color.white)
+    f_cell(1, 1, trendTxt,            trendCol,                   color.white)
+    f_cell(2, 0, "Zone",              color.new(color.black, 50), color.white)
+    f_cell(2, 1, zoneTxt,             zoneCol,                    color.white)
+    f_cell(3, 0, "Last Signal",       color.new(color.black, 50), color.white)
+    f_cell(3, 1, lastSignal,          sigCol,                     color.white)
+    f_cell(4, 0, "Signal Age",        color.new(color.black, 50), color.white)
+    f_cell(4, 1, sigBars,             color.new(color.black, 50), color.white)
+    f_cell(5, 0, "ATR(14)",           color.new(color.black, 50), color.white)
+    f_cell(5, 1, str.tostring(atr14, format.mintick), color.new(color.black, 50), color.white)
+    f_cell(6, 0, "TF",                color.new(color.black, 50), color.white)
+    f_cell(6, 1, timeframe.period,    color.new(color.black, 50), color.white)
+
+// =============================================================================
+//  11. ALERTS
+// =============================================================================
+// Wire any of these in TradingView via "Add Alert" -> condition = this script.
+alertcondition(bosUp        and alertBOS,    title = "Bullish BOS",        message = "{{ticker}} {{interval}} - Bullish BOS")
+alertcondition(bosDn        and alertBOS,    title = "Bearish BOS",        message = "{{ticker}} {{interval}} - Bearish BOS")
+alertcondition(chochUp      and alertCHoCH,  title = "Bullish CHoCH",      message = "{{ticker}} {{interval}} - Bullish CHoCH")
+alertcondition(chochDn      and alertCHoCH,  title = "Bearish CHoCH",      message = "{{ticker}} {{interval}} - Bearish CHoCH")
+alertcondition(sweepHigh    and alertSweep,  title = "Sell-side Sweep",    message = "{{ticker}} {{interval}} - Liquidity sweep ABOVE swing high")
+alertcondition(sweepLow     and alertSweep,  title = "Buy-side Sweep",     message = "{{ticker}} {{interval}} - Liquidity sweep BELOW swing low")
+alertcondition(bullReversal and alertRev,    title = "Bull Reversal",      message = "{{ticker}} {{interval}} - SMC Bullish Reversal")
+alertcondition(bearReversal and alertRev,    title = "Bear Reversal",      message = "{{ticker}} {{interval}} - SMC Bearish Reversal")
+
+// Catch-all alertcondition for "any signal" - useful for a single TV alert slot.
+anySignal = bullReversal or bearReversal or chochUp or chochDn
+alertcondition(anySignal, title = "SMC Any Reversal Cue",
+     message = "{{ticker}} {{interval}} - SMC reversal cue (CHoCH or full Reversal Signal)")

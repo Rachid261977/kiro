@@ -1,0 +1,1096 @@
+// =============================================================================
+//  SMC Supply & Demand Pro  -  Institutional Pivot-Candle Indicator
+//  Pine Script v6  |  Overlay  |  Multi-Timeframe  |  Non-Repaint
+// =============================================================================
+//
+//  STRATEGIE IMPLEMENTEE
+//  ---------------------
+//  Accumulation  ->  Bougie pivot institutionnelle  ->  Impulsion + BOS
+//                ->  Retour en zone Supply/Demand   ->  Entree confluencee
+//
+//  L'outil detecte mecaniquement la SEQUENCE complete (et pas seulement
+//  des bougies isolees) :
+//
+//    1) Phase d'accumulation : compression de range + ATR contracte
+//    2) Bougie pivot         : derniere bougie AVANT l'impulsion, scoree
+//                              (corps/meche, volume, alignement POC)
+//    3) Impulsion            : bougie de grand corps cassant la range
+//    4) Zone S/D             : high/low de la bougie pivot, etendue a droite,
+//                              mitigation auto, suppression si cassee
+//    5) BOS                  : ligne + label sur cassure de structure
+//    6) Liquidite            : internes / externes / equal highs-lows + sweep
+//    7) FVG                  : 3-bougies, filtre ATR, mitigation auto
+//    8) MTF                  : zone HTF (H4 par defaut) superposee aux zones
+//                              LTF -> setups "HTF-aligned" prioritaires
+//    9) Signal               : LONG = retour en demand + sweep + BOS up,
+//                              SHORT = miroir
+//   10) SL / TP1 / TP2 / BE  : calcules sur la zone et la liquidite externe,
+//                              RR affiche, BE auto a 1R
+//   11) Sessions             : Asie / Londres / NY (filtre optionnel)
+//   12) Trend filter         : structure (HH/HL vs LH/LL) + EMA optionnelle
+//   13) Score de confiance   : 0-100 par setup, base sur 5 facteurs
+//
+//  PHILOSOPHIE
+//  -----------
+//  Privilegier la PRECISION institutionnelle plutot que la frequence.
+//  Tous les objets sont confirmes a la cloture -> NON-REPAINT.
+//  Toutes les zones non valides sont auto-supprimees -> graphique propre.
+// =============================================================================
+
+//@version=6
+indicator(
+     title              = "SMC Supply & Demand Pro",
+     shorttitle         = "SMC SD Pro",
+     overlay            = true,
+     max_labels_count   = 500,
+     max_lines_count    = 500,
+     max_boxes_count    = 500
+ )
+
+// =============================================================================
+//  1. INPUTS
+// =============================================================================
+
+// --- Modules on/off ----------------------------------------------------------
+gpMod      = "1) Modules"
+useZones   = input.bool(true,  "Zones Supply / Demand", group = gpMod)
+useBOS     = input.bool(true,  "Break of Structure (BOS)", group = gpMod)
+useLiq     = input.bool(true,  "Liquidite (interne / externe)", group = gpMod)
+useFVG     = input.bool(true,  "Fair Value Gaps (FVG)", group = gpMod)
+useSig     = input.bool(true,  "Signaux d'entree LONG / SHORT", group = gpMod)
+useTrade   = input.bool(true,  "Affichage SL / TP / RR / BE", group = gpMod)
+useDash    = input.bool(true,  "Dashboard", group = gpMod)
+
+// --- Structure ---------------------------------------------------------------
+gpStr      = "2) Structure"
+leftBars   = input.int(5, "Pivot left",  minval = 1, group = gpStr)
+rightBars  = input.int(5, "Pivot right", minval = 1, group = gpStr,
+     tooltip = "Plus eleve = swings plus forts mais moins frequents.")
+
+// --- Accumulation ------------------------------------------------------------
+gpAcc      = "3) Accumulation"
+accumLen   = input.int(8,    "Longueur de la phase d'accumulation",
+     minval = 3, maxval = 30, group = gpAcc,
+     tooltip = "Nombre de bougies pour mesurer la compression.")
+compFactor = input.float(1.8, "Compression max (range / ATR)",
+     minval = 0.5, step = 0.1, group = gpAcc,
+     tooltip = "Range de la fenetre / ATR(14). Plus bas = plus serre.")
+volContr   = input.float(0.9, "Contraction de volatilite (ATR fenetre / ATR long)",
+     minval = 0.3, maxval = 1.5, step = 0.05, group = gpAcc,
+     tooltip = "ATR sur la fenetre rapporte a ATR long terme. <1 = volatilite ralentie.")
+
+// --- Impulsion ---------------------------------------------------------------
+gpImp      = "4) Impulsion"
+impBodyATR = input.float(1.0, "Corps minimum (x ATR)",
+     minval = 0.3, step = 0.1, group = gpImp,
+     tooltip = "Corps de la bougie d'impulsion en multiples d'ATR(14).")
+impBreak   = input.bool(true, "Doit casser le high/low de l'accumulation",
+     group = gpImp)
+
+// --- Zones Supply / Demand ---------------------------------------------------
+gpSD       = "5) Zones S/D"
+maxZones   = input.int(6, "Zones max par cote", minval = 2, maxval = 20, group = gpSD)
+mitigate   = input.string("Wick", "Mode de mitigation",
+     options = ["Wick", "Close"], group = gpSD,
+     tooltip = "Wick: zone touchee = mitigee. Close: la cloture doit entrer dedans.")
+killOnBreak = input.bool(true, "Supprimer la zone si entierement traversee", group = gpSD)
+demandCol  = input.color(color.new(#26a69a, 80), "Demand", group = gpSD, inline = "sd")
+supplyCol  = input.color(color.new(#ef5350, 80), "Supply", group = gpSD, inline = "sd")
+mitigCol   = input.color(color.new(#9e9e9e, 75), "Mitigee", group = gpSD, inline = "sd")
+htfAlignCol= input.color(color.new(#ffd54f, 70), "HTF aligne", group = gpSD, inline = "sd")
+
+// --- FVG ---------------------------------------------------------------------
+gpFvg      = "6) FVG"
+maxFVG     = input.int(6, "FVG max par cote", minval = 1, maxval = 15, group = gpFvg)
+minFvgATR  = input.float(0.25, "Taille FVG min (x ATR)",
+     minval = 0.0, step = 0.05, group = gpFvg)
+fvgBullCol = input.color(color.new(#26a69a, 80), "FVG Bull", group = gpFvg, inline = "fvg")
+fvgBearCol = input.color(color.new(#ef5350, 80), "FVG Bear", group = gpFvg, inline = "fvg")
+
+// --- Liquidite ---------------------------------------------------------------
+gpLiq      = "7) Liquidite"
+eqTolATR   = input.float(0.15, "Tolerance equal H/L (x ATR)",
+     minval = 0.0, step = 0.05, group = gpLiq,
+     tooltip = "Deux swings dont l'ecart < tolerance sont consideres comme equal.")
+sweepLkbk  = input.int(20, "Sweep lookback (bars)", minval = 5, group = gpLiq)
+liqBullCol = input.color(color.new(#42a5f5, 0), "BSL (buy-side)",  group = gpLiq, inline = "lq")
+liqBearCol = input.color(color.new(#ab47bc, 0), "SSL (sell-side)", group = gpLiq, inline = "lq")
+
+// --- MTF ---------------------------------------------------------------------
+gpMTF      = "8) Multi-Timeframe"
+useMTF     = input.bool(true, "Activer la confluence HTF", group = gpMTF)
+htfTF      = input.timeframe("240", "Timeframe HTF", group = gpMTF,
+     tooltip = "240=H4. Conseil: H4 sur M15, H1 sur M5, D sur H1.")
+htfShow    = input.bool(true, "Afficher la zone HTF", group = gpMTF)
+
+// --- Trend filter ------------------------------------------------------------
+gpTrend    = "9) Filtre de tendance"
+trendMode  = input.string("Structure", "Mode",
+     options = ["Off", "Structure", "EMA", "Structure + EMA"], group = gpTrend,
+     tooltip = "Structure: trend bullish si dernier HH ET dernier HL. EMA: close vs EMA.")
+emaLen     = input.int(50, "EMA length", minval = 5, group = gpTrend)
+
+// --- Sessions ----------------------------------------------------------------
+gpSes      = "10) Sessions (timezone du graphique)"
+useSes     = input.bool(false, "Filtrer les signaux par session", group = gpSes)
+sesAsia    = input.session("0000-0700", "Asie",     group = gpSes)
+sesLond    = input.session("0700-1600", "Londres",  group = gpSes)
+sesNY      = input.session("1300-2200", "New York", group = gpSes)
+sesTZ      = input.string("UTC", "Timezone",
+     options = ["UTC", "Europe/London", "America/New_York", "Asia/Tokyo"], group = gpSes)
+sigInLond  = input.bool(true,  "Signaux pendant Londres", group = gpSes)
+sigInNY    = input.bool(true,  "Signaux pendant NY",      group = gpSes)
+sigInAsia  = input.bool(false, "Signaux pendant Asie",    group = gpSes)
+showSesBg  = input.bool(false, "Surligner la session active", group = gpSes)
+
+// --- Signaux & risk ----------------------------------------------------------
+gpSig      = "11) Signaux & Risk"
+needLiqSweep   = input.bool(true,  "Exiger un sweep de liquidite", group = gpSig)
+needBOSConfirm = input.bool(true,  "Exiger un BOS dans le sens",  group = gpSig)
+needHTFAlign   = input.bool(false, "Exiger l'alignement HTF",     group = gpSig)
+minScore       = input.int(50, "Score minimum pour signaler", minval = 0, maxval = 100, group = gpSig,
+     tooltip = "Score 0-100 base sur 5 facteurs. Plus eleve = moins de signaux mais meilleurs.")
+minRR          = input.float(2.0, "RR minimum", minval = 0.5, step = 0.1, group = gpSig,
+     tooltip = "Rejette tout setup dont TP2/SL < RR min.")
+slBufATR       = input.float(0.3, "Buffer SL (x ATR)", minval = 0.0, step = 0.1, group = gpSig)
+beAtR          = input.float(1.0, "Passage BE a (R multiple)", minval = 0.0, step = 0.1, group = gpSig)
+
+// --- Affichage ---------------------------------------------------------------
+gpVis      = "12) Affichage"
+showSwings = input.bool(true,  "Labels HH/HL/LH/LL",       group = gpVis)
+showAccum  = input.bool(true,  "Marquer l'accumulation",   group = gpVis)
+showPivot  = input.bool(true,  "Marquer la bougie pivot",  group = gpVis)
+showScore  = input.bool(true,  "Score sur la zone",        group = gpVis)
+showLiq    = input.bool(true,  "Lignes de liquidite",      group = gpVis)
+showSweep  = input.bool(true,  "Marqueurs de sweep",       group = gpVis)
+
+// =============================================================================
+//  2. HELPERS
+// =============================================================================
+
+// ATR rapide et ATR long pour mesurer la contraction de volatilite.
+atr14   = ta.atr(14)
+atr50   = ta.atr(50)
+atrWin  = ta.atr(accumLen)            // ATR sur la fenetre d'accumulation
+
+// Body / wick metrics (utilises pour scorer la bougie pivot).
+bodyAbs    = math.abs(close - open)
+rangeAbs   = high - low
+bodyRatio  = rangeAbs > 0 ? bodyAbs / rangeAbs : 0.0
+upperWick  = high - math.max(close, open)
+lowerWick  = math.min(close, open) - low
+wickRatio  = rangeAbs > 0 ? (upperWick + lowerWick) / rangeAbs : 0.0
+
+// EMA de tendance.
+emaTrend = ta.ema(close, emaLen)
+
+// Sessions (renvoient true si la bougie en cours est dans la fenetre).
+inAsia = useSes ? not na(time(timeframe.period, sesAsia, sesTZ)) : false
+inLond = useSes ? not na(time(timeframe.period, sesLond, sesTZ)) : false
+inNY   = useSes ? not na(time(timeframe.period, sesNY,   sesTZ)) : false
+inSes  = useSes ? ((sigInAsia and inAsia) or (sigInLond and inLond) or (sigInNY and inNY)) : true
+
+bgcolor(showSesBg and useSes and (inLond or inNY)
+     ? color.new(color.yellow, 94) : na, title = "Session")
+
+// =============================================================================
+//  3. SWINGS / STRUCTURE
+// =============================================================================
+// `ta.pivothigh` / `ta.pivotlow` confirment apres `rightBars` bougies cloturees.
+// Au moment ou la valeur est non-na, le pivot reel se trouve a
+// `bar_index - rightBars`, avec prix `ph` / `pl` -> zero repaint.
+
+ph = ta.pivothigh(high, leftBars, rightBars)
+pl = ta.pivotlow (low,  leftBars, rightBars)
+
+var float lastSH    = na
+var int   lastSHbar = na
+var float prevSH    = na
+var float lastSL    = na
+var int   lastSLbar = na
+var float prevSL    = na
+var int   trend     = 0    // +1 bullish (HH+HL), -1 bearish (LH+LL), 0 mixte
+
+isNewSH = not na(ph)
+isNewSL = not na(pl)
+
+if isNewSH
+    prevSH    := lastSH
+    lastSH    := ph
+    lastSHbar := bar_index - rightBars
+    if showSwings
+        isHH = not na(prevSH) and ph > prevSH
+        label.new(lastSHbar, ph, isHH ? "HH" : "LH",
+             style = label.style_label_down,
+             color = isHH ? color.new(#26a69a, 0) : color.new(#ef5350, 0),
+             textcolor = color.white, size = size.tiny, yloc = yloc.abovebar)
+
+if isNewSL
+    prevSL    := lastSL
+    lastSL    := pl
+    lastSLbar := bar_index - rightBars
+    if showSwings
+        isHL = not na(prevSL) and pl > prevSL
+        label.new(lastSLbar, pl, isHL ? "HL" : "LL",
+             style = label.style_label_up,
+             color = isHL ? color.new(#26a69a, 0) : color.new(#ef5350, 0),
+             textcolor = color.white, size = size.tiny, yloc = yloc.belowbar)
+
+// Trend structurel : HH + HL recent => bullish ; LH + LL recent => bearish.
+if isNewSH
+    if not na(prevSH) and not na(prevSL)
+        if ph > prevSH and not na(lastSL) and lastSL > prevSL
+            trend := 1
+        else if ph < prevSH
+            trend := -1
+if isNewSL
+    if not na(prevSL) and not na(prevSH)
+        if pl < prevSL and not na(lastSH) and lastSH < prevSH
+            trend := -1
+        else if pl > prevSL
+            trend := 1
+
+// =============================================================================
+//  4. BREAK OF STRUCTURE (BOS) + CHoCH implicite
+// =============================================================================
+// On consomme le swing casse (set na) pour ne pas redessiner sur chaque bougie.
+
+bosUp   = false
+bosDn   = false
+chochUp = false
+chochDn = false
+prevTrend = trend
+
+brokeUp = useBOS and not na(lastSH) and barstate.isconfirmed and close > lastSH
+brokeDn = useBOS and not na(lastSL) and barstate.isconfirmed and close < lastSL
+
+if brokeUp
+    if prevTrend == 1
+        bosUp := true
+    else
+        chochUp := true
+        trend   := 1
+    line.new(lastSHbar, lastSH, bar_index, lastSH,
+         color = color.new(#26a69a, 0),
+         style = chochUp ? line.style_dashed : line.style_solid,
+         width = 1)
+    label.new(bar_index, lastSH, chochUp ? "CHoCH" : "BOS",
+         style = label.style_label_down,
+         color = color.new(#26a69a, 0),
+         textcolor = color.white, size = size.tiny, yloc = yloc.price)
+    lastSH    := na
+    lastSHbar := na
+
+if brokeDn
+    if prevTrend == -1
+        bosDn := true
+    else
+        chochDn := true
+        trend   := -1
+    line.new(lastSLbar, lastSL, bar_index, lastSL,
+         color = color.new(#ef5350, 0),
+         style = chochDn ? line.style_dashed : line.style_solid,
+         width = 1)
+    label.new(bar_index, lastSL, chochDn ? "CHoCH" : "BOS",
+         style = label.style_label_up,
+         color = color.new(#ef5350, 0),
+         textcolor = color.white, size = size.tiny, yloc = yloc.price)
+    lastSL    := na
+    lastSLbar := na
+
+// =============================================================================
+//  5. ACCUMULATION
+// =============================================================================
+// Une fenetre de `accumLen` bougies est consideree comme accumulation si :
+//   - son range total <= ATR(14) * compFactor       (compression de prix)
+//   - ATR(accumLen) <= ATR(50) * volContr           (volatilite contractee)
+//
+// On memorise le high/low de la fenetre courante d'accumulation
+// pour pouvoir tester ensuite si une bougie d'impulsion la casse.
+
+accumHi = ta.highest(high, accumLen)
+accumLo = ta.lowest(low,  accumLen)
+accumRng = accumHi - accumLo
+
+isCompressed = accumRng > 0 and accumRng <= atr14 * compFactor and atrWin <= atr50 * volContr
+
+// Marqueur visuel discret au DEBUT de la zone d'accumulation.
+if showAccum and isCompressed and barstate.isconfirmed and not isCompressed[1]
+    label.new(bar_index, accumLo, "ACC",
+         style = label.style_label_up,
+         color = color.new(color.gray, 30),
+         textcolor = color.white, size = size.tiny, yloc = yloc.belowbar)
+
+// =============================================================================
+//  6. IMPULSION + BOUGIE PIVOT INSTITUTIONNELLE
+// =============================================================================
+// Une bougie d'impulsion vraie satisfait :
+//   - corps absolu >= impBodyATR * ATR(14)
+//   - cloture au-dela du high/low de la fenetre d'accumulation precedente
+//
+// La bougie pivot est la DERNIERE bougie de l'accumulation (bar_index - 1
+// par rapport a la bougie d'impulsion). On la score avec 5 facteurs :
+//
+//   1) Petitesse du corps (40 pts)   : 1 - bodyRatio
+//   2) Mecheage (20 pts)             : wickRatio
+//   3) Volume du pivot (15 pts)      : volume[1] / max(volume) sur la fenetre
+//   4) Alignement POC (15 pts)       : proximite cloture pivot vs VWAP de la
+//                                      fenetre d'accumulation
+//   5) Compression effective (10 pts): (range / (ATR*compFactor))^-1
+//
+// Score total = 0..100.
+
+isImpUp = (close - open) >= atr14 * impBodyATR and (not impBreak or close > accumHi[1])
+isImpDn = (open - close) >= atr14 * impBodyATR and (not impBreak or close < accumLo[1])
+
+// VWAP de la fenetre d'accumulation (proxy de POC sans volume profile reel).
+typPrice = (high + low + close) / 3
+sumPV    = math.sum(typPrice * volume, accumLen)
+sumV     = math.sum(volume, accumLen)
+accumPOC = sumV > 0 ? sumPV / sumV : (accumHi + accumLo) / 2
+
+// Volume max sur la fenetre (pour normaliser le facteur 3).
+maxVolWin = ta.highest(volume, accumLen)
+
+// Score de la bougie pivot (la bougie [1] precedant l'impulsion).
+f_pivotScore() =>
+    br = nz(bodyRatio[1], 1.0)
+    wr = nz(wickRatio[1], 0.0)
+    vr = maxVolWin > 0 ? volume[1] / maxVolWin : 0.0
+    pocDist = math.abs(close[1] - accumPOC) / math.max(atr14, syminfo.mintick)
+    pocScore = math.max(0.0, 1.0 - pocDist)                  // 1 si pile sur POC
+    compRef  = atr14 * compFactor
+    compScore = compRef > 0 ? math.max(0.0, 1.0 - accumRng / compRef) : 0.0
+    score = (1.0 - br) * 40 + wr * 20 + vr * 15 + pocScore * 15 + compScore * 10
+    math.round(math.max(0.0, math.min(100.0, score)))
+
+// Etat persistant pour le dernier setup detecte.
+var int   lastImpBar    = na
+var int   lastPivotBar  = na
+var float pivotHi       = na
+var float pivotLo       = na
+var int   pivotDir      = 0       // +1 demand, -1 supply
+var int   pivotScore    = 0
+
+// CW10003 fix : on appelle f_pivotScore() de maniere INCONDITIONNELLE sur
+// CHAQUE barre pour que l'historique des series internes (`[1]`) reste
+// consistant. La valeur n'est utilisee que si une impulsion est detectee.
+pivotScoreCalc = f_pivotScore()
+
+// Detection finale de l'impulsion + pivot (uniquement sur cloture confirmee).
+newDemand = false
+newSupply = false
+
+if barstate.isconfirmed and isCompressed[1]
+    if isImpUp and not isImpUp[1]
+        lastImpBar    := bar_index
+        lastPivotBar  := bar_index - 1
+        pivotHi       := high[1]
+        pivotLo       := low[1]
+        pivotDir      := 1
+        pivotScore    := pivotScoreCalc
+        newDemand     := true
+        if showPivot
+            label.new(lastPivotBar, low[1], "Pivot",
+                 style = label.style_label_up,
+                 color = color.new(#26a69a, 0),
+                 textcolor = color.white, size = size.tiny, yloc = yloc.belowbar)
+
+    if isImpDn and not isImpDn[1]
+        lastImpBar    := bar_index
+        lastPivotBar  := bar_index - 1
+        pivotHi       := high[1]
+        pivotLo       := low[1]
+        pivotDir      := -1
+        pivotScore    := pivotScoreCalc
+        newSupply     := true
+        if showPivot
+            label.new(lastPivotBar, high[1], "Pivot",
+                 style = label.style_label_down,
+                 color = color.new(#ef5350, 0),
+                 textcolor = color.white, size = size.tiny, yloc = yloc.abovebar)
+
+// =============================================================================
+//  7. ZONES SUPPLY / DEMAND
+// =============================================================================
+// Chaque zone est stockee sous forme de struct parallele dans des arrays :
+//   - boxes (objet box)         : la box dessinee
+//   - tops, bots                : prix
+//   - bars                      : barre de creation (= lastPivotBar)
+//   - scores                    : score 0-100
+//   - mitFlags                  : 0 = active, 1 = mitigee
+//   - htfFlags                  : 1 si HTF-aligned
+
+var box[]   demBoxes  = array.new<box>()
+var float[] demTops   = array.new<float>()
+var float[] demBots   = array.new<float>()
+var int[]   demBars   = array.new<int>()
+var int[]   demScores = array.new<int>()
+var int[]   demMit    = array.new<int>()
+var int[]   demHTF    = array.new<int>()
+
+var box[]   supBoxes  = array.new<box>()
+var float[] supTops   = array.new<float>()
+var float[] supBots   = array.new<float>()
+var int[]   supBars   = array.new<int>()
+var int[]   supScores = array.new<int>()
+var int[]   supMit    = array.new<int>()
+var int[]   supHTF    = array.new<int>()
+
+// Fonction utilitaire : couleur d'une zone selon etat.
+f_zoneColor(int dir, int mit, int htf) =>
+    mit == 1   ? mitigCol :
+       htf == 1   ? htfAlignCol :
+       dir == 1   ? demandCol : supplyCol
+
+// Creation d'une nouvelle zone Demand.
+if useZones and newDemand
+    bx = box.new(lastPivotBar, pivotHi, bar_index + 10, pivotLo,
+         bgcolor      = f_zoneColor(1, 0, 0),
+         border_color = color.new(#26a69a, 40),
+         border_width = 1,
+         extend       = extend.right,
+         text         = showScore ? "Demand " + str.tostring(pivotScore) : "Demand",
+         text_size    = size.tiny,
+         text_color   = color.white,
+         text_halign  = text.align_left,
+         text_valign  = text.align_center)
+    array.push(demBoxes,  bx)
+    array.push(demTops,   pivotHi)
+    array.push(demBots,   pivotLo)
+    array.push(demBars,   lastPivotBar)
+    array.push(demScores, pivotScore)
+    array.push(demMit,    0)
+    array.push(demHTF,    0)
+
+if useZones and newSupply
+    bx = box.new(lastPivotBar, pivotHi, bar_index + 10, pivotLo,
+         bgcolor      = f_zoneColor(-1, 0, 0),
+         border_color = color.new(#ef5350, 40),
+         border_width = 1,
+         extend       = extend.right,
+         text         = showScore ? "Supply " + str.tostring(pivotScore) : "Supply",
+         text_size    = size.tiny,
+         text_color   = color.white,
+         text_halign  = text.align_left,
+         text_valign  = text.align_center)
+    array.push(supBoxes,  bx)
+    array.push(supTops,   pivotHi)
+    array.push(supBots,   pivotLo)
+    array.push(supBars,   lastPivotBar)
+    array.push(supScores, pivotScore)
+    array.push(supMit,    0)
+    array.push(supHTF,    0)
+
+// Mitigation + suppression des zones.
+//   - Demand mitigee  : low de la bougie courante <= top de la zone
+//                       (Wick) ou close <= top et close >= bot (Close)
+//   - Demand cassee   : close < bot (zone violee) -> remove si killOnBreak
+f_updateDemand() =>
+    if array.size(demBoxes) > 0
+        for i = array.size(demBoxes) - 1 to 0
+            t   = array.get(demTops, i)
+            b   = array.get(demBots, i)
+            mit = array.get(demMit,  i)
+            tappedW = low <= t and low >= b
+            tappedC = close <= t and close >= b
+            tapped  = mitigate == "Wick" ? tappedW : tappedC
+            broken  = close < b
+            if mit == 0 and tapped
+                array.set(demMit, i, 1)
+                box.set_bgcolor(array.get(demBoxes, i), mitigCol)
+            if killOnBreak and broken
+                box.delete(array.get(demBoxes, i))
+                array.remove(demBoxes,  i)
+                array.remove(demTops,   i)
+                array.remove(demBots,   i)
+                array.remove(demBars,   i)
+                array.remove(demScores, i)
+                array.remove(demMit,    i)
+                array.remove(demHTF,    i)
+        // Trim a maxZones.
+        while array.size(demBoxes) > maxZones
+            box.delete(array.shift(demBoxes))
+            array.shift(demTops)
+            array.shift(demBots)
+            array.shift(demBars)
+            array.shift(demScores)
+            array.shift(demMit)
+            array.shift(demHTF)
+
+f_updateSupply() =>
+    if array.size(supBoxes) > 0
+        for i = array.size(supBoxes) - 1 to 0
+            t   = array.get(supTops, i)
+            b   = array.get(supBots, i)
+            mit = array.get(supMit,  i)
+            tappedW = high >= b and high <= t
+            tappedC = close >= b and close <= t
+            tapped  = mitigate == "Wick" ? tappedW : tappedC
+            broken  = close > t
+            if mit == 0 and tapped
+                array.set(supMit, i, 1)
+                box.set_bgcolor(array.get(supBoxes, i), mitigCol)
+            if killOnBreak and broken
+                box.delete(array.get(supBoxes, i))
+                array.remove(supBoxes,  i)
+                array.remove(supTops,   i)
+                array.remove(supBots,   i)
+                array.remove(supBars,   i)
+                array.remove(supScores, i)
+                array.remove(supMit,    i)
+                array.remove(supHTF,    i)
+        while array.size(supBoxes) > maxZones
+            box.delete(array.shift(supBoxes))
+            array.shift(supTops)
+            array.shift(supBots)
+            array.shift(supBars)
+            array.shift(supScores)
+            array.shift(supMit)
+            array.shift(supHTF)
+
+if useZones
+    f_updateDemand()
+    f_updateSupply()
+
+// =============================================================================
+//  8. FAIR VALUE GAPS
+// =============================================================================
+// Imbalance 3-bougies :
+//   Bull FVG : low[0]  > high[2]  -> gap entre high[2] (bot) et low[0] (top)
+//   Bear FVG : high[0] < low[2]   -> gap entre high[0] (top) et low[2] (bot)
+// La bougie centrale [1] est l'impulsion qui a cree le gap.
+
+var box[]   bullFVGs    = array.new<box>()
+var float[] bullFVGTops = array.new<float>()
+var float[] bullFVGBots = array.new<float>()
+var box[]   bearFVGs    = array.new<box>()
+var float[] bearFVGTops = array.new<float>()
+var float[] bearFVGBots = array.new<float>()
+
+bullFVG = useFVG and barstate.isconfirmed and low > high[2]
+bearFVG = useFVG and barstate.isconfirmed and high < low[2]
+fvgGap  = bullFVG ? low - high[2] : bearFVG ? low[2] - high : 0.0
+fvgOk   = fvgGap >= minFvgATR * atr14
+
+if bullFVG and fvgOk
+    bx = box.new(bar_index - 2, low, bar_index + 10, high[2],
+         bgcolor      = fvgBullCol,
+         border_color = color.new(#26a69a, 60),
+         border_width = 1,
+         extend       = extend.right)
+    array.push(bullFVGs, bx)
+    array.push(bullFVGTops, low)
+    array.push(bullFVGBots, high[2])
+
+if bearFVG and fvgOk
+    bx = box.new(bar_index - 2, high, bar_index + 10, low[2],
+         bgcolor      = fvgBearCol,
+         border_color = color.new(#ef5350, 60),
+         border_width = 1,
+         extend       = extend.right)
+    array.push(bearFVGs, bx)
+    array.push(bearFVGTops, low[2])
+    array.push(bearFVGBots, high)
+
+// Mitigation FVG : un FVG bull est rempli si le low traverse son bot.
+f_updateBullFVG() =>
+    if array.size(bullFVGs) > 0
+        for i = array.size(bullFVGs) - 1 to 0
+            bot = array.get(bullFVGBots, i)
+            if low <= bot
+                box.delete(array.get(bullFVGs, i))
+                array.remove(bullFVGs,    i)
+                array.remove(bullFVGTops, i)
+                array.remove(bullFVGBots, i)
+        while array.size(bullFVGs) > maxFVG
+            box.delete(array.shift(bullFVGs))
+            array.shift(bullFVGTops)
+            array.shift(bullFVGBots)
+
+f_updateBearFVG() =>
+    if array.size(bearFVGs) > 0
+        for i = array.size(bearFVGs) - 1 to 0
+            top = array.get(bearFVGTops, i)
+            if high >= top
+                box.delete(array.get(bearFVGs, i))
+                array.remove(bearFVGs,    i)
+                array.remove(bearFVGTops, i)
+                array.remove(bearFVGBots, i)
+        while array.size(bearFVGs) > maxFVG
+            box.delete(array.shift(bearFVGs))
+            array.shift(bearFVGTops)
+            array.shift(bearFVGBots)
+
+if useFVG
+    f_updateBullFVG()
+    f_updateBearFVG()
+
+// =============================================================================
+//  9. LIQUIDITE (interne / externe + sweep + equal H/L)
+// =============================================================================
+// On garde les N derniers swings comme pools de liquidite. On detecte les
+// equal highs/lows par clustering : deux swings dont l'ecart est inferieur
+// a `eqTolATR * ATR(14)` partagent la meme ligne.
+
+var float[] liqHighs    = array.new<float>()
+var int[]   liqHighBars = array.new<int>()
+var line[]  liqHighLn   = array.new<line>()
+var float[] liqLows     = array.new<float>()
+var int[]   liqLowBars  = array.new<int>()
+var line[]  liqLowLn    = array.new<line>()
+
+if useLiq and isNewSH
+    array.push(liqHighs,    ph)
+    array.push(liqHighBars, bar_index - rightBars)
+    if showLiq
+        // Equal high : trait plein quand cluster detecte.
+        isEq = false
+        if array.size(liqHighs) >= 2
+            prev = array.get(liqHighs, array.size(liqHighs) - 2)
+            isEq := math.abs(ph - prev) <= eqTolATR * atr14
+        ln = line.new(bar_index - rightBars, ph, bar_index + 5, ph,
+             color  = liqBullCol,
+             style  = isEq ? line.style_solid : line.style_dotted,
+             width  = isEq ? 2 : 1,
+             extend = extend.right)
+        array.push(liqHighLn, ln)
+    while array.size(liqHighs) > 8
+        array.shift(liqHighs)
+        array.shift(liqHighBars)
+        if showLiq and array.size(liqHighLn) > 0
+            line.delete(array.shift(liqHighLn))
+
+if useLiq and isNewSL
+    array.push(liqLows,    pl)
+    array.push(liqLowBars, bar_index - rightBars)
+    if showLiq
+        isEq = false
+        if array.size(liqLows) >= 2
+            prev = array.get(liqLows, array.size(liqLows) - 2)
+            isEq := math.abs(pl - prev) <= eqTolATR * atr14
+        ln = line.new(bar_index - rightBars, pl, bar_index + 5, pl,
+             color  = liqBearCol,
+             style  = isEq ? line.style_solid : line.style_dotted,
+             width  = isEq ? 2 : 1,
+             extend = extend.right)
+        array.push(liqLowLn, ln)
+    while array.size(liqLows) > 8
+        array.shift(liqLows)
+        array.shift(liqLowBars)
+        if showLiq and array.size(liqLowLn) > 0
+            line.delete(array.shift(liqLowLn))
+
+// Sweep : meche au-dela d'un swing recent + close revenue de l'autre cote.
+sweepHigh = false
+sweepLow  = false
+
+if useLiq and barstate.isconfirmed and array.size(liqHighs) > 0
+    rh    = array.get(liqHighs, array.size(liqHighs) - 1)
+    rhBar = array.get(liqHighBars, array.size(liqHighBars) - 1)
+    if (bar_index - rhBar) <= sweepLkbk and high > rh and close < rh
+        sweepHigh := true
+
+if useLiq and barstate.isconfirmed and array.size(liqLows) > 0
+    rl    = array.get(liqLows, array.size(liqLows) - 1)
+    rlBar = array.get(liqLowBars, array.size(liqLowBars) - 1)
+    if (bar_index - rlBar) <= sweepLkbk and low < rl and close > rl
+        sweepLow := true
+
+if showSweep and sweepHigh
+    label.new(bar_index, high, "x", style = label.style_xcross,
+         color = liqBearCol, textcolor = color.white, size = size.tiny,
+         yloc = yloc.abovebar)
+if showSweep and sweepLow
+    label.new(bar_index, low, "x", style = label.style_xcross,
+         color = liqBullCol, textcolor = color.white, size = size.tiny,
+         yloc = yloc.belowbar)
+
+// =============================================================================
+//  10. MTF  -  zone HTF + alignement
+// =============================================================================
+// Approche : recuperer high / low / direction du pivot HTF via request.security
+// et les comparer aux zones LTF. Si une zone LTF tombe DANS le range pivot HTF
+// du meme cote -> "HTF aligned".
+//
+// IMPORTANT (correctif "l'indicateur ne suit pas les bougies") :
+// On NE recupere PAS le bar_index du HTF, car c'est une coordonnee dans la
+// grille de bougies HTF (ex. H4 a 16x moins de bougies que M15). L'utiliser
+// comme bar_index LTF dessinait une box demarrant des milliers de bougies en
+// arriere -> zones geantes qui ne collaient pas au prix.
+//
+// A la place : on capture nous-memes le bar_index LTF a l'instant ou les
+// valeurs HTF changent (= nouvelle zone HTF detectee), et on dessine la box
+// depuis ce point jusqu'a la bougie courante.
+
+[htfPHi_, htfPLo_, htfPDir_] = request.security(
+     syminfo.tickerid, htfTF,
+     [pivotHi, pivotLo, pivotDir],
+     lookahead = barmerge.lookahead_off)
+
+float htfPivotHi  = useMTF ? htfPHi_  : float(na)
+float htfPivotLo  = useMTF ? htfPLo_  : float(na)
+int   htfPivotDir = useMTF ? htfPDir_ : 0
+
+// Detection d'un changement de zone HTF + ancrage LTF.
+var float htfPrevHi  = na
+var float htfPrevLo  = na
+var int   htfLeftLTF = na
+
+htfZoneChanged = useMTF and not na(htfPivotHi) and not na(htfPivotLo) and (na(htfPrevHi) or htfPivotHi != htfPrevHi or htfPivotLo != htfPrevLo)
+
+if htfZoneChanged
+    htfLeftLTF := bar_index
+    htfPrevHi  := htfPivotHi
+    htfPrevLo  := htfPivotLo
+
+// Affichage / mise a jour de la box HTF (une seule, la plus recente).
+var box htfBox = na
+
+if htfShow and htfZoneChanged
+    if not na(htfBox)
+        box.delete(htfBox)
+    bg = htfPivotDir == 1 ? color.new(#00bcd4, 88) : color.new(#ff9800, 88)
+    bd = htfPivotDir == 1 ? color.new(#00bcd4, 40) : color.new(#ff9800, 40)
+    htfBox := box.new(htfLeftLTF, htfPivotHi,
+         bar_index + 10, htfPivotLo,
+         bgcolor = bg, border_color = bd, border_width = 2,
+         extend = extend.right,
+         text = "HTF " + htfTF, text_size = size.tiny,
+         text_color = color.white,
+         text_halign = text.align_right, text_valign = text.align_top)
+
+// Nettoyage si on desactive le module HTF en cours de session.
+if not useMTF and not na(htfBox)
+    box.delete(htfBox)
+    htfBox := na
+
+// Marquage des zones LTF qui sont DANS la zone HTF.
+if useMTF and not na(htfPivotHi) and not na(htfPivotLo)
+    if array.size(demBoxes) > 0
+        for i = 0 to array.size(demBoxes) - 1
+            t = array.get(demTops, i)
+            b = array.get(demBots, i)
+            inHTF = htfPivotDir == 1 and t <= htfPivotHi and b >= htfPivotLo
+            if inHTF and array.get(demHTF, i) == 0
+                array.set(demHTF, i, 1)
+                if array.get(demMit, i) == 0
+                    box.set_bgcolor(array.get(demBoxes, i), htfAlignCol)
+    if array.size(supBoxes) > 0
+        for i = 0 to array.size(supBoxes) - 1
+            t = array.get(supTops, i)
+            b = array.get(supBots, i)
+            inHTF = htfPivotDir == -1 and t <= htfPivotHi and b >= htfPivotLo
+            if inHTF and array.get(supHTF, i) == 0
+                array.set(supHTF, i, 1)
+                if array.get(supMit, i) == 0
+                    box.set_bgcolor(array.get(supBoxes, i), htfAlignCol)
+
+// =============================================================================
+//  11. SIGNAL ENGINE
+// =============================================================================
+// LONG  : bougie courante touche une demand active + sweep low recent
+//         + BOS up confirme dans une fenetre + score >= minScore + filtre trend
+// SHORT : miroir.
+
+f_trendOkLong() =>
+    structOk = (trendMode == "Off") or trend == 1
+    emaOk    = (trendMode == "Off") or close > emaTrend
+    trendMode == "Structure"        ? structOk :
+       trendMode == "EMA"              ? emaOk :
+       trendMode == "Structure + EMA"  ? (structOk and emaOk) : true
+
+f_trendOkShort() =>
+    structOk = (trendMode == "Off") or trend == -1
+    emaOk    = (trendMode == "Off") or close < emaTrend
+    trendMode == "Structure"        ? structOk :
+       trendMode == "EMA"              ? emaOk :
+       trendMode == "Structure + EMA"  ? (structOk and emaOk) : true
+
+// Trouve la zone Demand active de plus haut score qui contient le low courant.
+f_demandTouchedScore() =>
+    int    bestIdx = -1
+    int    bestSc  = -1
+    bool   bestHTF = false
+    if array.size(demBoxes) > 0
+        for i = 0 to array.size(demBoxes) - 1
+            if array.get(demMit, i) == 0
+                t = array.get(demTops, i)
+                b = array.get(demBots, i)
+                if low <= t and high >= b           // bougie touche la zone
+                    sc = array.get(demScores, i)
+                    if sc > bestSc
+                        bestSc  := sc
+                        bestIdx := i
+                        bestHTF := array.get(demHTF, i) == 1
+    [bestIdx, bestSc, bestHTF]
+
+f_supplyTouchedScore() =>
+    int    bestIdx = -1
+    int    bestSc  = -1
+    bool   bestHTF = false
+    if array.size(supBoxes) > 0
+        for i = 0 to array.size(supBoxes) - 1
+            if array.get(supMit, i) == 0
+                t = array.get(supTops, i)
+                b = array.get(supBots, i)
+                if high >= b and low <= t
+                    sc = array.get(supScores, i)
+                    if sc > bestSc
+                        bestSc  := sc
+                        bestIdx := i
+                        bestHTF := array.get(supHTF, i) == 1
+    [bestIdx, bestSc, bestHTF]
+
+// Memoire des derniers sweeps et BOS pour les fenetrer dans le temps.
+var int lastSweepLowBar  = na
+var int lastSweepHighBar = na
+var int lastBosUpBar     = na
+var int lastBosDnBar     = na
+if sweepLow
+    lastSweepLowBar := bar_index
+if sweepHigh
+    lastSweepHighBar := bar_index
+if bosUp or chochUp
+    lastBosUpBar := bar_index
+if bosDn or chochDn
+    lastBosDnBar := bar_index
+
+[demIdx, demSc, demIsHTF] = f_demandTouchedScore()
+[supIdx, supSc, supIsHTF] = f_supplyTouchedScore()
+
+// Confluences booleennes.
+sweepOkL = needLiqSweep ? (not na(lastSweepLowBar)  and (bar_index - lastSweepLowBar)  <= sweepLkbk) : true
+sweepOkS = needLiqSweep ? (not na(lastSweepHighBar) and (bar_index - lastSweepHighBar) <= sweepLkbk) : true
+bosOkL   = needBOSConfirm ? (not na(lastBosUpBar) and (bar_index - lastBosUpBar) <= 30) : true
+bosOkS   = needBOSConfirm ? (not na(lastBosDnBar) and (bar_index - lastBosDnBar) <= 30) : true
+htfOkL   = needHTFAlign ? demIsHTF : true
+htfOkS   = needHTFAlign ? supIsHTF : true
+
+// Bougie de confirmation (impulsive dans le sens du trade).
+confirmL = (close - open) > atr14 * 0.4 and close > open
+confirmS = (open - close) > atr14 * 0.4 and close < open
+
+longSig  = useSig and barstate.isconfirmed and inSes and demIdx >= 0 and demSc >= minScore and sweepOkL and bosOkL and htfOkL and confirmL and f_trendOkLong()
+shortSig = useSig and barstate.isconfirmed and inSes and supIdx >= 0 and supSc >= minScore and sweepOkS and bosOkS and htfOkS and confirmS and f_trendOkShort()
+
+// Anti-doublons : un signal par direction par zone.
+var int lastLongIdx  = -1
+var int lastShortIdx = -1
+if longSig and lastLongIdx == demIdx
+    longSig := false
+if shortSig and lastShortIdx == supIdx
+    shortSig := false
+if longSig
+    lastLongIdx := demIdx
+if shortSig
+    lastShortIdx := supIdx
+
+// =============================================================================
+//  12. SL / TP / RR / BE
+// =============================================================================
+// SL = sous le bot de la zone (long) ou au-dessus du top (short) + buffer ATR.
+// TP1 = liquidite externe la plus proche dans le sens du trade.
+// TP2 = liquidite suivante, ou x3 R si pas de seconde liquidite.
+// RR  = (TP / SL) - rejet si < minRR.
+// BE  = passage SL au prix d'entree apres avoir atteint beAtR.
+
+f_nearestLiqAbove(float px) =>
+    float best = na
+    if array.size(liqHighs) > 0
+        for i = 0 to array.size(liqHighs) - 1
+            v = array.get(liqHighs, i)
+            if v > px and (na(best) or v < best)
+                best := v
+    best
+
+f_nearestLiqBelow(float px) =>
+    float best = na
+    if array.size(liqLows) > 0
+        for i = 0 to array.size(liqLows) - 1
+            v = array.get(liqLows, i)
+            if v < px and (na(best) or v > best)
+                best := v
+    best
+
+f_secondLiqAbove(float px, float first) =>
+    float best = na
+    if array.size(liqHighs) > 0
+        for i = 0 to array.size(liqHighs) - 1
+            v = array.get(liqHighs, i)
+            if v > nz(first, px) and (na(best) or v < best)
+                best := v
+    best
+
+f_secondLiqBelow(float px, float first) =>
+    float best = na
+    if array.size(liqLows) > 0
+        for i = 0 to array.size(liqLows) - 1
+            v = array.get(liqLows, i)
+            if v < nz(first, px) and (na(best) or v > best)
+                best := v
+    best
+
+// Etat persistant du dernier setup affiche.
+var float entryPx  = na
+var float slPx     = na
+var float tp1Px    = na
+var float tp2Px    = na
+var float rrVal    = na
+var int   sigDir   = 0   // +1 long, -1 short
+var int   sigBar   = na
+var bool  beHit    = false
+
+// LONG setup
+if longSig
+    entry = close
+    sl    = array.get(demBots, demIdx) - slBufATR * atr14
+    rDist = entry - sl
+    if rDist > 0
+        tp1 = nz(f_nearestLiqAbove(entry),    entry + rDist * 2)
+        tp2 = nz(f_secondLiqAbove(entry, tp1), entry + rDist * 3)
+        rr  = (tp2 - entry) / rDist
+        if rr >= minRR
+            entryPx := entry
+            slPx    := sl
+            tp1Px   := tp1
+            tp2Px   := tp2
+            rrVal   := rr
+            sigDir  := 1
+            sigBar  := bar_index
+            beHit   := false
+            label.new(bar_index, low, "BUY " + str.tostring(demSc),
+                 style = label.style_label_up,
+                 color = color.new(#00c853, 0),
+                 textcolor = color.white, size = size.normal,
+                 yloc = yloc.belowbar)
+
+// SHORT setup
+if shortSig
+    entry = close
+    sl    = array.get(supTops, supIdx) + slBufATR * atr14
+    rDist = sl - entry
+    if rDist > 0
+        tp1 = nz(f_nearestLiqBelow(entry),    entry - rDist * 2)
+        tp2 = nz(f_secondLiqBelow(entry, tp1), entry - rDist * 3)
+        rr  = (entry - tp2) / rDist
+        if rr >= minRR
+            entryPx := entry
+            slPx    := sl
+            tp1Px   := tp1
+            tp2Px   := tp2
+            rrVal   := rr
+            sigDir  := -1
+            sigBar  := bar_index
+            beHit   := false
+            label.new(bar_index, high, "SELL " + str.tostring(supSc),
+                 style = label.style_label_down,
+                 color = color.new(#d50000, 0),
+                 textcolor = color.white, size = size.normal,
+                 yloc = yloc.abovebar)
+
+// Suivi BE : declenche quand le prix atteint beAtR du SL initial.
+if sigDir == 1 and not beHit and not na(entryPx) and not na(slPx)
+    rUnit = entryPx - slPx
+    if rUnit > 0 and high >= entryPx + rUnit * beAtR
+        slPx  := entryPx
+        beHit := true
+if sigDir == -1 and not beHit and not na(entryPx) and not na(slPx)
+    rUnit = slPx - entryPx
+    if rUnit > 0 and low <= entryPx - rUnit * beAtR
+        slPx  := entryPx
+        beHit := true
+
+// Sortie virtuelle : on efface le setup si TP2 ou SL touche.
+if sigDir == 1 and (high >= nz(tp2Px, 1e10) or low <= nz(slPx, -1e10))
+    sigDir := 0
+if sigDir == -1 and (low <= nz(tp2Px, -1e10) or high >= nz(slPx, 1e10))
+    sigDir := 0
+
+// --- Plot des niveaux du dernier setup actif --------------------------------
+plot(useTrade and sigDir != 0 ? entryPx : na, "Entry",
+     color = color.new(color.white, 0),  style = plot.style_linebr, linewidth = 1)
+plot(useTrade and sigDir != 0 ? slPx    : na, "SL",
+     color = color.new(#ef5350, 0),      style = plot.style_linebr, linewidth = 2)
+plot(useTrade and sigDir != 0 ? tp1Px   : na, "TP1",
+     color = color.new(#26a69a, 30),     style = plot.style_linebr, linewidth = 1)
+plot(useTrade and sigDir != 0 ? tp2Px   : na, "TP2",
+     color = color.new(#26a69a, 0),      style = plot.style_linebr, linewidth = 2)
+
+// =============================================================================
+//  13. DASHBOARD
+// =============================================================================
+var table dash = table.new(position.top_right, 2, 9,
+     bgcolor = color.new(color.black, 80),
+     border_width = 1, border_color = color.new(color.gray, 60))
+
+f_cell(int r, int c, string txt, color bg, color fg) =>
+    table.cell(dash, c, r, txt, bgcolor = bg, text_color = fg, text_size = size.small)
+
+if useDash and barstate.islast
+    trendTxt = trend == 1 ? "BULLISH" : trend == -1 ? "BEARISH" : "MIXED"
+    trendCol = trend == 1 ? color.new(#26a69a, 0) :
+       trend == -1 ? color.new(#ef5350, 0) : color.gray
+    sesTxt   = inLond ? "LONDON" : inNY ? "NEW YORK" :
+       inAsia ? "ASIA"   : "OFF SESSION"
+    sesCol   = (inLond or inNY) ? color.new(#ffb300, 30) :
+       inAsia ? color.new(#42a5f5, 30) : color.new(color.gray, 50)
+    sigTxt   = sigDir == 1 ? "LONG"  : sigDir == -1 ? "SHORT" : "-"
+    sigCol   = sigDir == 1 ? color.new(#00c853, 0) :
+       sigDir == -1 ? color.new(#d50000, 0) : color.new(color.gray, 30)
+    rrTxt    = na(rrVal) ? "-" : str.tostring(rrVal, "#.##") + " R"
+    htfBias  = na(htfPivotDir) ? "-" : htfPivotDir == 1 ? "DEMAND" :
+       htfPivotDir == -1 ? "SUPPLY" : "-"
+
+    f_cell(0, 0, "SMC S&D Pro",      color.new(color.black, 30), color.white)
+    f_cell(0, 1, syminfo.ticker + " " + timeframe.period,
+                                     color.new(color.black, 30), color.white)
+    f_cell(1, 0, "Trend",            color.new(color.black, 50), color.white)
+    f_cell(1, 1, trendTxt,           trendCol, color.white)
+    f_cell(2, 0, "Session",          color.new(color.black, 50), color.white)
+    f_cell(2, 1, sesTxt,             sesCol, color.white)
+    f_cell(3, 0, "HTF (" + htfTF + ")", color.new(color.black, 50), color.white)
+    f_cell(3, 1, htfBias,            color.new(color.black, 50), color.white)
+    f_cell(4, 0, "Demand zones",     color.new(color.black, 50), color.white)
+    f_cell(4, 1, str.tostring(array.size(demBoxes)),
+                                     color.new(color.black, 50), color.white)
+    f_cell(5, 0, "Supply zones",     color.new(color.black, 50), color.white)
+    f_cell(5, 1, str.tostring(array.size(supBoxes)),
+                                     color.new(color.black, 50), color.white)
+    f_cell(6, 0, "Last signal",      color.new(color.black, 50), color.white)
+    f_cell(6, 1, sigTxt,             sigCol, color.white)
+    f_cell(7, 0, "RR",               color.new(color.black, 50), color.white)
+    f_cell(7, 1, rrTxt,              color.new(color.black, 50), color.white)
+    f_cell(8, 0, "ATR(14)",          color.new(color.black, 50), color.white)
+    f_cell(8, 1, str.tostring(atr14, format.mintick),
+                                     color.new(color.black, 50), color.white)
+
+// =============================================================================
+//  14. ALERTES
+// =============================================================================
+alertcondition(newDemand, title = "Nouvelle Demand zone",
+     message = "{{ticker}} {{interval}} - Nouvelle DEMAND zone detectee")
+alertcondition(newSupply, title = "Nouvelle Supply zone",
+     message = "{{ticker}} {{interval}} - Nouvelle SUPPLY zone detectee")
+alertcondition(bosUp,    title = "BOS Bullish",
+     message = "{{ticker}} {{interval}} - BOS bullish")
+alertcondition(bosDn,    title = "BOS Bearish",
+     message = "{{ticker}} {{interval}} - BOS bearish")
+alertcondition(chochUp,  title = "CHoCH Bullish",
+     message = "{{ticker}} {{interval}} - CHoCH bullish (debut de retournement haussier)")
+alertcondition(chochDn,  title = "CHoCH Bearish",
+     message = "{{ticker}} {{interval}} - CHoCH bearish (debut de retournement baissier)")
+alertcondition(sweepLow, title = "Sweep buy-side liquidity",
+     message = "{{ticker}} {{interval}} - Sweep de liquidite SOUS le low")
+alertcondition(sweepHigh,title = "Sweep sell-side liquidity",
+     message = "{{ticker}} {{interval}} - Sweep de liquidite AU-DESSUS du high")
+alertcondition(bullFVG,  title = "FVG Bullish",
+     message = "{{ticker}} {{interval}} - FVG bullish cree")
+alertcondition(bearFVG,  title = "FVG Bearish",
+     message = "{{ticker}} {{interval}} - FVG bearish cree")
+alertcondition(longSig,  title = "Signal LONG",
+     message = "{{ticker}} {{interval}} - SIGNAL LONG SMC S&D")
+alertcondition(shortSig, title = "Signal SHORT",
+     message = "{{ticker}} {{interval}} - SIGNAL SHORT SMC S&D")
+alertcondition(longSig or shortSig, title = "Tout signal d'entree",
+     message = "{{ticker}} {{interval}} - Nouveau signal SMC S&D")
