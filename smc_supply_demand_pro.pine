@@ -709,38 +709,61 @@ if showSweep and sweepLow
 // =============================================================================
 //  10. MTF  -  zone HTF + alignement
 // =============================================================================
-// Approche : recuperer le high/low de la fenetre d'accumulation HTF ainsi que
-// la bougie pivot HTF (range = pivotHi/Lo). On les compare aux zones LTF :
-// si une zone LTF tombe DANS le range pivot HTF du meme cote -> "HTF aligned".
+// Approche : recuperer high / low / direction du pivot HTF via request.security
+// et les comparer aux zones LTF. Si une zone LTF tombe DANS le range pivot HTF
+// du meme cote -> "HTF aligned".
+//
+// IMPORTANT (correctif "l'indicateur ne suit pas les bougies") :
+// On NE recupere PAS le bar_index du HTF, car c'est une coordonnee dans la
+// grille de bougies HTF (ex. H4 a 16x moins de bougies que M15). L'utiliser
+// comme bar_index LTF dessinait une box demarrant des milliers de bougies en
+// arriere -> zones geantes qui ne collaient pas au prix.
+//
+// A la place : on capture nous-memes le bar_index LTF a l'instant ou les
+// valeurs HTF changent (= nouvelle zone HTF detectee), et on dessine la box
+// depuis ce point jusqu'a la bougie courante.
 
-// CE10163 fix : un ternaire en Pine v6 ne peut pas retourner un tuple.
-// On appelle TOUJOURS request.security et on ignore les valeurs si useMTF est
-// desactive. Cela ne coute rien : la securite est evaluee de toute facon en
-// arriere-plan, et on filtre simplement la lecture en aval.
-[htfPHi_, htfPLo_, htfPDir_, htfPBar_] = request.security(
+[htfPHi_, htfPLo_, htfPDir_] = request.security(
      syminfo.tickerid, htfTF,
-     [pivotHi, pivotLo, pivotDir, lastPivotBar],
+     [pivotHi, pivotLo, pivotDir],
      lookahead = barmerge.lookahead_off)
 
 float htfPivotHi  = useMTF ? htfPHi_  : float(na)
 float htfPivotLo  = useMTF ? htfPLo_  : float(na)
 int   htfPivotDir = useMTF ? htfPDir_ : 0
-int   htfPivotBar = useMTF ? htfPBar_ : int(na)
 
-// Affichage de la zone HTF (une seule, la plus recente).
+// Detection d'un changement de zone HTF + ancrage LTF.
+var float htfPrevHi  = na
+var float htfPrevLo  = na
+var int   htfLeftLTF = na
+
+htfZoneChanged = useMTF and not na(htfPivotHi) and not na(htfPivotLo) and (na(htfPrevHi) or htfPivotHi != htfPrevHi or htfPivotLo != htfPrevLo)
+
+if htfZoneChanged
+    htfLeftLTF := bar_index
+    htfPrevHi  := htfPivotHi
+    htfPrevLo  := htfPivotLo
+
+// Affichage / mise a jour de la box HTF (une seule, la plus recente).
 var box htfBox = na
-if useMTF and htfShow and not na(htfPivotHi) and not na(htfPivotLo) and (na(htfBox) or box.get_top(htfBox) != htfPivotHi or box.get_bottom(htfBox) != htfPivotLo)
+
+if htfShow and htfZoneChanged
     if not na(htfBox)
         box.delete(htfBox)
     bg = htfPivotDir == 1 ? color.new(#00bcd4, 88) : color.new(#ff9800, 88)
     bd = htfPivotDir == 1 ? color.new(#00bcd4, 40) : color.new(#ff9800, 40)
-    htfBox := box.new(nz(htfPivotBar, bar_index - 30), htfPivotHi,
+    htfBox := box.new(htfLeftLTF, htfPivotHi,
          bar_index + 10, htfPivotLo,
          bgcolor = bg, border_color = bd, border_width = 2,
          extend = extend.right,
          text = "HTF " + htfTF, text_size = size.tiny,
          text_color = color.white,
          text_halign = text.align_right, text_valign = text.align_top)
+
+// Nettoyage si on desactive le module HTF en cours de session.
+if not useMTF and not na(htfBox)
+    box.delete(htfBox)
+    htfBox := na
 
 // Marquage des zones LTF qui sont DANS la zone HTF.
 if useMTF and not na(htfPivotHi) and not na(htfPivotLo)
