@@ -40,7 +40,7 @@
 //@version=6
 indicator(
      title              = "SMC Supply & Demand Pro",
-     shorttitle         = "SMC S&D Pro",
+     shorttitle         = "SMC SD Pro",
      overlay            = true,
      max_labels_count   = 500,
      max_lines_count    = 500,
@@ -372,6 +372,11 @@ var float pivotLo       = na
 var int   pivotDir      = 0       // +1 demand, -1 supply
 var int   pivotScore    = 0
 
+// CW10003 fix : on appelle f_pivotScore() de maniere INCONDITIONNELLE sur
+// CHAQUE barre pour que l'historique des series internes (`[1]`) reste
+// consistant. La valeur n'est utilisee que si une impulsion est detectee.
+pivotScoreCalc = f_pivotScore()
+
 // Detection finale de l'impulsion + pivot (uniquement sur cloture confirmee).
 newDemand = false
 newSupply = false
@@ -383,7 +388,7 @@ if barstate.isconfirmed and isCompressed[1]
         pivotHi       := high[1]
         pivotLo       := low[1]
         pivotDir      := 1
-        pivotScore    := f_pivotScore()
+        pivotScore    := pivotScoreCalc
         newDemand     := true
         if showPivot
             label.new(lastPivotBar, low[1], "Pivot",
@@ -397,7 +402,7 @@ if barstate.isconfirmed and isCompressed[1]
         pivotHi       := high[1]
         pivotLo       := low[1]
         pivotDir      := -1
-        pivotScore    := f_pivotScore()
+        pivotScore    := pivotScoreCalc
         newSupply     := true
         if showPivot
             label.new(lastPivotBar, high[1], "Pivot",
@@ -708,11 +713,19 @@ if showSweep and sweepLow
 // la bougie pivot HTF (range = pivotHi/Lo). On les compare aux zones LTF :
 // si une zone LTF tombe DANS le range pivot HTF du meme cote -> "HTF aligned".
 
-[htfPivotHi, htfPivotLo, htfPivotDir, htfPivotBar] = useMTF ?
-     request.security(syminfo.tickerid, htfTF,
-          [pivotHi, pivotLo, pivotDir, lastPivotBar],
-          lookahead = barmerge.lookahead_off) :
-     [float(na), float(na), 0, int(na)]
+// CE10163 fix : un ternaire en Pine v6 ne peut pas retourner un tuple.
+// On appelle TOUJOURS request.security et on ignore les valeurs si useMTF est
+// desactive. Cela ne coute rien : la securite est evaluee de toute facon en
+// arriere-plan, et on filtre simplement la lecture en aval.
+[htfPHi_, htfPLo_, htfPDir_, htfPBar_] = request.security(
+     syminfo.tickerid, htfTF,
+     [pivotHi, pivotLo, pivotDir, lastPivotBar],
+     lookahead = barmerge.lookahead_off)
+
+float htfPivotHi  = useMTF ? htfPHi_  : float(na)
+float htfPivotLo  = useMTF ? htfPLo_  : float(na)
+int   htfPivotDir = useMTF ? htfPDir_ : 0
+int   htfPivotBar = useMTF ? htfPBar_ : int(na)
 
 // Affichage de la zone HTF (une seule, la plus recente).
 var box htfBox = na
